@@ -9,6 +9,7 @@ dependencies = [
     "mlx>=0.31.1",
     "mlx-lm>=0.31.2",
     "numpy>=2.4.4",
+    "tensorboard>=2.20.0",
     "torch>=2.11.0",
     "tqdm>=4.67.3",
     "transformers>=5.5.3",

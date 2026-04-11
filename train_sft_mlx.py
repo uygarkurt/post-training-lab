@@ -13,10 +13,12 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 import numpy as np
+import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoConfig
 from mlx_lm import load
 from safetensors.numpy import save_file as safetensors_save
+from torch.utils.tensorboard import SummaryWriter
 
 from data_prep import get_prep_module
 
@@ -58,28 +60,33 @@ def prepare_datasets(args, tokenizer):
         validation_split=args.validation_split,
     )
     
+    # Limit dataset size if max_samples is specified
+    if args.max_samples > 0:
+        # Limit training dataset
+        if len(train_dataset) > args.max_samples:
+            train_dataset = torch.utils.data.Subset(train_dataset, range(args.max_samples))
+            logging.info(f"Limited training dataset to {args.max_samples} samples")
+        
+        # Proportionally limit validation dataset
+        val_limit = max(1, int(args.max_samples * args.validation_split))
+        if len(val_dataset) > val_limit:
+            val_dataset = torch.utils.data.Subset(val_dataset, range(val_limit))
+            logging.info(f"Limited validation dataset to {val_limit} samples")
+    
     logging.info(f"Train: {len(train_dataset)} • Val: {len(val_dataset)}")
     return train_dataset, val_dataset
 
 
-def create_optimizer_and_scheduler(model, args, total_steps: int):
-    """Create AdamW optimizer with cosine warmup scheduler."""
+def create_optimizer(model, args):
+    """Create AdamW optimizer."""
     optimizer = optim.AdamW(
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay
     )
     
-    warmup_steps = int(total_steps * args.warmup_ratio)
+    logging.info(f"AdamW optimizer • Learning rate: {args.learning_rate}")
     
-    def lr_schedule(step):
-        if step < warmup_steps:
-            return args.learning_rate * (step / max(1, warmup_steps))
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return args.learning_rate * max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
-    
-    logging.info(f"AdamW optimizer • Cosine scheduler • {warmup_steps} warmup steps")
-    
-    return optimizer, lr_schedule
+    return optimizer
 
 
 def save_checkpoint(model, tokenizer, model_config, epoch, step, args):
@@ -191,7 +198,7 @@ def loss_fn(model, input_ids, labels):
     return loss
 
 
-def train(model, tokenizer, model_config, train_loader, val_loader, optimizer, lr_schedule, args):
+def train(model, tokenizer, model_config, train_loader, val_loader, optimizer, args, writer=None):
     """Main training loop with gradient accumulation."""
     global_step = 0
     effective_batch = args.batch_size * args.gradient_accumulation_steps
@@ -204,14 +211,21 @@ def train(model, tokenizer, model_config, train_loader, val_loader, optimizer, l
     # Create loss and gradient function
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
     
+    # Calculate total steps (optimizer updates, not iterations)
+    steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+    total_steps = steps_per_epoch * args.num_epochs
+    if args.max_steps > 0:
+        total_steps = min(total_steps, args.max_steps)
+    
     for epoch in range(args.num_epochs):
         accumulated_grads = None
         num_accumulated = 0
         epoch_loss = 0.0
         
-        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_epochs}")
+        # Progress bar tracks actual steps, not iterations
+        progress = tqdm(total=steps_per_epoch, desc=f"Epoch {epoch + 1}/{args.num_epochs}")
         
-        for step, batch in enumerate(progress):
+        for step, batch in enumerate(train_loader):
             # Convert to MLX arrays and add batch dimension
             input_ids = mx.array(batch["input_ids"].numpy())[None, :]  # Shape: (1, seq_len)
             labels = mx.array(batch["labels"].numpy())[None, :]  # Shape: (1, seq_len)
@@ -248,10 +262,6 @@ def train(model, tokenizer, model_config, train_loader, val_loader, optimizer, l
                     scale = args.max_grad_norm / grad_norm
                     avg_grads = tree_map(lambda g: g * scale, avg_grads)
                 
-                # Update learning rate
-                current_lr = lr_schedule(global_step)
-                optimizer.learning_rate = current_lr
-                
                 # Optimizer step
                 optimizer.update(model, avg_grads)
                 mx.eval(model.parameters())
@@ -261,18 +271,28 @@ def train(model, tokenizer, model_config, train_loader, val_loader, optimizer, l
                 num_accumulated = 0
                 global_step += 1
                 
-                # Logging
-                if global_step % args.logging_steps == 0:
-                    progress.set_postfix({
-                        "loss": f"{loss.item():.4f}",
-                        "lr": f"{current_lr:.2e}",
-                        "step": global_step
-                    })
+                # Update progress bar (now tracks actual steps)
+                progress.update(1)
+                progress.set_postfix({
+                    "loss": f"{loss.item():.4f}"
+                })
+                
+                # TensorBoard logging
+                if writer is not None:
+                    if global_step % args.logging_steps == 0:
+                        writer.add_scalar('train/loss', loss.item(), global_step)
+                        writer.add_scalar('train/learning_rate', args.learning_rate, global_step)
+                        writer.add_scalar('train/grad_norm', grad_norm.item(), global_step)
+                        writer.add_scalar('train/epoch', epoch + (step / len(train_loader)), global_step)
                 
                 # Validation
                 if global_step % args.eval_steps == 0:
                     val_loss = evaluate(model, val_loader, args)
                     logging.info(f"Step {global_step} • Val loss: {val_loss:.4f}")
+                    
+                    # Log validation loss to TensorBoard
+                    if writer is not None:
+                        writer.add_scalar('eval/loss', val_loss, global_step)
                 
                 # Checkpointing
                 if global_step % args.save_steps == 0:
@@ -280,6 +300,9 @@ def train(model, tokenizer, model_config, train_loader, val_loader, optimizer, l
                 
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
+        
+        # Close progress bar for this epoch
+        progress.close()
         
         save_checkpoint(model, tokenizer, model_config, epoch + 1, global_step, args)
         
@@ -327,14 +350,16 @@ def parse_args():
     parser.add_argument("--output_dir", default="./output_mlx")
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
-    parser.add_argument("--max_seq_length", type=int, default=256)
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--eval_steps", type=int, default=250)
+    parser.add_argument("--max_seq_length", type=int, default=512)
+    parser.add_argument("--max_samples", type=int, default=-1,
+                        help="Maximum number of samples to use from dataset (-1 = use all)")
+    parser.add_argument("--save_steps", type=int, default=2000)
+    parser.add_argument("--eval_steps", type=int, default=2000)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_total_limit", type=int, default=3)
     parser.add_argument("--validation_split", type=float, default=0.05)
@@ -348,6 +373,12 @@ def main():
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     with open(Path(args.output_dir) / "config.json", "w") as f:
         json.dump(vars(args), f, indent=2)
+    
+    # Initialize TensorBoard writer
+    tensorboard_dir = Path(args.output_dir) / "tensorboard"
+    writer = SummaryWriter(log_dir=str(tensorboard_dir))
+    logging.info(f"TensorBoard logs: {tensorboard_dir}")
+    logging.info(f"To view: tensorboard --logdir={tensorboard_dir}")
     
     model, _ = load(args.model_name)
     # Loading like this Solves TypeError: 'TokenizerWrapper' object is not callable
@@ -364,20 +395,21 @@ def main():
     
     # Show sample
     sample = tokenizer.decode(train_dataset[0]["input_ids"], skip_special_tokens=False)
-    logging.info(f"\nSample ({len(train_dataset[0]['input_ids'])} tokens):\n{sample[:500]}...\n")
+    logging.info(f"\nSample ({len(train_dataset[0]['input_ids'])} tokens):\n{sample}\n")
     
-    # Calculate training steps
-    steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
-    total_steps = min(steps_per_epoch * args.num_epochs, args.max_steps) \
-                    if args.max_steps > 0 else steps_per_epoch * args.num_epochs
+    optimizer = create_optimizer(model, args)
     
-    optimizer, lr_schedule = create_optimizer_and_scheduler(model, args, total_steps)
+    # Log hyperparameters to TensorBoard
+    writer.add_text('config/hyperparameters', json.dumps(vars(args), indent=2), 0)
     
-    model = train(model, tokenizer, model_config, train_loader, val_loader, optimizer, lr_schedule, args)
+    model = train(model, tokenizer, model_config, train_loader, val_loader, optimizer, args, writer)
     
     # Save final model
     final_dir = Path(args.output_dir) / "final_model"
     save_model(model, tokenizer, model_config, final_dir)
+    
+    # Close TensorBoard writer
+    writer.close()
     
     logging.info(f"\n{'='*80}\nFinal model saved to {final_dir}\n{'='*80}")
 
