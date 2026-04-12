@@ -32,13 +32,8 @@ from mlx_lm.tuner.utils import linear_to_lora_layers
 
 from tensorboardX import SummaryWriter
 
-from data_preperation.gsm8k import DATASET_NAME as _GSM8K_NAME
-from data_preperation.magpie_reasoning import DATASET_NAME as _MAGPIE_NAME
-
-_DATASET_REGISTRY = {
-    _GSM8K_NAME:  "data_preperation.gsm8k",
-    _MAGPIE_NAME: "data_preperation.magpie_reasoning",
-}
+import data_preperation.gsm8k as _gsm8k_data
+import data_preperation.magpie_reasoning as _magpie_data
 
 
 
@@ -54,7 +49,7 @@ def parse_args():
 
     # Model / data
     parser.add_argument("--model",           type=str,   default="Qwen/Qwen2-0.5B-Instruct-MLX", help="HuggingFace model name or local path")
-    parser.add_argument("--dataset",         type=str,   default="openai/gsm8k",                 help=f"Dataset to train on. Supported: {list(_DATASET_REGISTRY.keys())}")
+    parser.add_argument("--dataset",         type=str,   default="gsm8k",                         help="Dataset to use: gsm8k or magpie")
     parser.add_argument("--val-split",        type=float, default=0.1,                              help="Fraction of data held out for validation (0–1)")
     parser.add_argument("--eval-every",       type=int,   default=100,                              help="Evaluate on validation set every N steps")
     parser.add_argument("--seed",             type=int,   default=42,                               help="Random seed for data shuffling and train/val split")
@@ -236,10 +231,12 @@ def main():
 
     # ---- Load and tokenise data --------------------------------------------
     print("Loading dataset ...")
-    if args.dataset not in _DATASET_REGISTRY:
-        raise ValueError(f"Unknown dataset '{args.dataset}'. Supported: {list(_DATASET_REGISTRY.keys())}")
-    import importlib
-    build_dataloaders = importlib.import_module(_DATASET_REGISTRY[args.dataset]).build_dataloaders
+    if args.dataset == "gsm8k":
+        build_dataloaders = _gsm8k_data.build_dataloaders
+    elif args.dataset == "magpie":
+        build_dataloaders = _magpie_data.build_dataloaders
+    else:
+        raise ValueError(f"Unknown dataset '{args.dataset}'. Choose from: gsm8k, magpie")
     train_loader, val_loader = build_dataloaders(tokenizer, args)
 
     # ---- Optimizer ---------------------------------------------------------
@@ -259,12 +256,15 @@ def main():
     step     = 0
     ema_loss = None
     ema_beta = 0.9
+    tok_s    = 0.0
     t0       = time.time()
     t_log    = time.time()
 
     data_iter = itertools.chain.from_iterable(
         itertools.repeat(train_loader)
     )
+
+    pbar = tqdm(total=args.num_iters, desc="train", unit="step", dynamic_ncols=True)
 
     while step < args.num_iters:
         input_ids, loss_mask = next(data_iter)
@@ -304,15 +304,15 @@ def main():
             dt    = time.time() - t_log
             tok_s = ntoks.item() * args.log_every / max(dt, 1e-8) if step > 0 else 0.0
             writer.add_scalar("train/tokens_per_sec", tok_s, step)
-            print(
-                f"step {step:5d} | "
-                f"loss {ema_loss:.4f} | "
-                f"lr {lr_val:.2e} | "
-                f"gnorm {gnorm_val:.3f} | "
-                f"tok/s {tok_s:6.0f} | "
-                f"elapsed {time.time() - t0:5.0f}s"
-            )
             t_log = time.time()
+
+        pbar.set_postfix(
+            loss=f"{ema_loss:.4f}",
+            lr=f"{lr_val:.2e}",
+            gnorm=f"{gnorm_val:.3f}",
+            tok_s=f"{tok_s:.0f}",
+        )
+        pbar.update(1)
 
         # TensorBoard parameter histograms — logged less frequently.
         if step % args.param_log_every == 0:
@@ -323,13 +323,16 @@ def main():
         if step > 0 and step % args.eval_every == 0:
             val_loss = evaluate(model, val_loader)
             writer.add_scalar("val/loss", val_loss, step)
-            print(f"  [eval] step {step:5d} | val_loss {val_loss:.4f}")
+            pbar.write(f"  [eval] step {step:5d} | val_loss {val_loss:.4f}")
 
         # ---- Checkpoint ----------------------------------------------------
         if step > 0 and step % args.save_every == 0:
+            pbar.write(f"  [ckpt] step {step:5d} | saving checkpoint ...")
             save_full_checkpoint(model, step, args)
 
         step += 1
+
+    pbar.close()
 
     # Final checkpoint.
     save_full_checkpoint(model, step, args)
