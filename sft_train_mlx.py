@@ -12,15 +12,17 @@ Dependencies:
     pip install mlx mlx-lm datasets transformers tensorboard
 """
 
+import argparse
+import itertools
 import json
 import os
-import random
 import subprocess
 import sys
 import tempfile
 import time
 
 import numpy as np
+from tqdm import tqdm
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
@@ -28,132 +30,78 @@ from mlx.utils import tree_flatten
 from mlx_lm import load
 from mlx_lm.tuner.utils import linear_to_lora_layers
 
-from datasets import load_dataset as hf_load_dataset
-
 from tensorboardX import SummaryWriter
 
-# ---------------------------------------------------------------------------
-# Config — edit these to change run behaviour
-# ---------------------------------------------------------------------------
+from data_preperation.gsm8k import DATASET_NAME as _GSM8K_NAME
+from data_preperation.magpie_reasoning import DATASET_NAME as _MAGPIE_NAME
 
-MODEL_NAME     = "Qwen/Qwen2-0.5B-Instruct-MLX"
-DATASET_NAME   = "openai/gsm8k"
-DATASET_SUBSET = "socratic"
-DATASET_SPLIT  = "train"
+_DATASET_REGISTRY = {
+    _GSM8K_NAME:  "data_preperation.gsm8k",
+    _MAGPIE_NAME: "data_preperation.magpie_reasoning",
+}
 
-MAX_SEQ_LEN    = 512     # Shorter context to fit memory; raise if you have headroom
-BATCH_SIZE     = 2       # Per-step batch size
-LR             = 2e-4    # Peak learning rate
-NUM_ITERS      = 500     # Total gradient steps
-WARMUP_STEPS   = 20      # Linear warmup steps
 
-# LoRA
-LORA_RANK      = 8       # LoRA rank (r)
-LORA_ALPHA     = 16      # LoRA alpha (scale = alpha / rank)
-LORA_LAYERS    = 8       # Number of transformer layers to apply LoRA to (last N)
-
-# Logging / checkpointing
-LOG_EVERY       = 10      # Print loss + TensorBoard scalars every N steps
-SAVE_EVERY      = 100     # Save adapter checkpoint every N steps
-CHECKPOINT_DIR  = "./checkpoints"
-TENSORBOARD_DIR = "./runs"  # tensorboard --logdir=runs
-PARAM_LOG_EVERY = 50      # Log LoRA parameter histograms every N steps
 
 # ---------------------------------------------------------------------------
-# Data loading and tokenisation
+# Argument parsing
 # ---------------------------------------------------------------------------
 
-def load_and_tokenise(tokenizer):
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Minimal SFT training script — MLX on Apple Silicon.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Model / data
+    parser.add_argument("--model",           type=str,   default="Qwen/Qwen2-0.5B-Instruct-MLX", help="HuggingFace model name or local path")
+    parser.add_argument("--dataset",         type=str,   default="openai/gsm8k",                 help=f"Dataset to train on. Supported: {list(_DATASET_REGISTRY.keys())}")
+    parser.add_argument("--val-split",        type=float, default=0.1,                              help="Fraction of data held out for validation (0–1)")
+    parser.add_argument("--eval-every",       type=int,   default=100,                              help="Evaluate on validation set every N steps")
+    parser.add_argument("--seed",             type=int,   default=42,                               help="Random seed for data shuffling and train/val split")
+
+    # Training
+    parser.add_argument("--max-seq-len",     type=int,   default=512,   help="Maximum sequence length (tokens)")
+    parser.add_argument("--batch-size",      type=int,   default=2,     help="Per-step batch size")
+    parser.add_argument("--lr",              type=float, default=2e-4,  help="Peak learning rate")
+    parser.add_argument("--num-iters",       type=int,   default=500,   help="Total gradient steps")
+    parser.add_argument("--warmup-steps",    type=int,   default=20,    help="Linear warmup steps")
+
+    # LoRA
+    parser.add_argument("--lora-rank",       type=int,   default=8,     help="LoRA rank (r)")
+    parser.add_argument("--lora-alpha",      type=float, default=16.0,  help="LoRA alpha (scale = alpha / rank)")
+    parser.add_argument("--lora-layers",     type=int,   default=8,     help="Number of transformer layers to apply LoRA to (last N)")
+
+    # Logging / checkpointing
+    parser.add_argument("--log-every",       type=int,   default=10,    help="Print loss + TensorBoard scalars every N steps")
+    parser.add_argument("--save-every",      type=int,   default=100,   help="Save adapter checkpoint every N steps")
+    parser.add_argument("--checkpoint-dir",  type=str,   default="./checkpoints", help="Directory for checkpoints")
+    parser.add_argument("--tensorboard-dir", type=str,   default="./runs",        help="Directory for TensorBoard logs")
+    parser.add_argument("--param-log-every", type=int,   default=50,    help="Log LoRA parameter histograms every N steps")
+
+    return parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def evaluate(model, val_loader):
     """
-    Load GSM8K and produce a list of (input_ids, loss_mask) pairs.
+    Compute mean SFT loss over the full validation set (no gradients).
 
-    loss_mask is a binary float list:
-        0 = prompt token  (no gradient contribution)
-        1 = answer token  (supervised)
+    Iterates the DataLoader once and returns a plain Python float.
     """
-    ds = hf_load_dataset(DATASET_NAME, DATASET_SUBSET, split=DATASET_SPLIT)
+    total_loss = 0.0
+    total_toks = 0
 
-    samples = []
-    skipped = 0
+    for input_ids, loss_mask in tqdm(val_loader, desc="  eval", leave=False, unit="batch"):
+        loss, ntoks = sft_loss(model, input_ids, loss_mask)
+        mx.eval(loss, ntoks)
 
-    for row in ds:
-        question = row["question"]
-        answer   = row["answer"]
+        n = ntoks.item()
+        total_loss += loss.item() * n
+        total_toks += n
 
-        # Render the user prompt so we can find where the answer begins.
-        prompt_text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": question}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        # Full conversation: user question + assistant CoT answer.
-        full_text = tokenizer.apply_chat_template(
-            [
-                {"role": "user",      "content": question},
-                {"role": "assistant", "content": answer},
-            ],
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-
-        prompt_ids = tokenizer.encode(prompt_text)
-        full_ids   = tokenizer.encode(full_text)
-
-        # Skip degenerate samples.
-        if len(full_ids) < 4 or len(prompt_ids) >= len(full_ids):
-            skipped += 1
-            continue
-
-        # Truncate to MAX_SEQ_LEN.
-        full_ids = full_ids[:MAX_SEQ_LEN]
-
-        # Build binary loss mask aligned with full_ids.
-        # Everything up to (and including) the prompt gets 0; the rest gets 1.
-        prompt_len = min(len(prompt_ids), len(full_ids))
-        loss_mask  = [0] * prompt_len + [1] * (len(full_ids) - prompt_len)
-        loss_mask  = loss_mask[:MAX_SEQ_LEN]
-
-        # Skip if the answer was entirely cropped away.
-        if sum(loss_mask) == 0:
-            skipped += 1
-            continue
-
-        samples.append((full_ids, loss_mask))
-
-    print(f"  {len(samples)} samples loaded, {skipped} skipped.")
-    return samples
-
-
-def iterate_batches(samples, batch_size, pad_id):
-    """
-    Infinitely yields shuffled batches of (input_ids, loss_mask) as MLX arrays.
-
-    Sequences within a batch are right-padded to the same length.
-    Padding positions are masked out (loss_mask = 0) automatically.
-    """
-    while True:
-        indices = list(range(len(samples)))
-        random.shuffle(indices)
-
-        for start in range(0, len(indices) - batch_size + 1, batch_size):
-            batch_idx   = indices[start : start + batch_size]
-            batch_ids   = [samples[i][0] for i in batch_idx]
-            batch_masks = [samples[i][1] for i in batch_idx]
-
-            max_len = max(len(ids) for ids in batch_ids)
-
-            padded_ids   = []
-            padded_masks = []
-            for ids, mask in zip(batch_ids, batch_masks):
-                pad = max_len - len(ids)
-                padded_ids.append(ids   + [pad_id] * pad)
-                padded_masks.append(mask + [0]     * pad)
-
-            yield (
-                mx.array(padded_ids,   dtype=mx.int32),
-                mx.array(padded_masks, dtype=mx.float32),
-            )
+    return total_loss / total_toks if total_toks > 0 else float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +152,7 @@ def compute_grad_norm(grads):
 # Checkpoint saving
 # ---------------------------------------------------------------------------
 
-def save_full_checkpoint(model, step):
+def save_full_checkpoint(model, step, args):
     """
     Save a fully-merged checkpoint loadable by mlx_lm.load().
 
@@ -216,7 +164,7 @@ def save_full_checkpoint(model, step):
     The live training model is NOT modified — fusing happens inside the
     subprocess on a fresh model load.
     """
-    out_dir = os.path.join(CHECKPOINT_DIR, f"step_{step:06d}")
+    out_dir = os.path.join(args.checkpoint_dir, f"step_{step:06d}")
     os.makedirs(out_dir, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -229,10 +177,10 @@ def save_full_checkpoint(model, step):
         #    config.num_layers (SimpleNamespace) before applying LoRA layers.
         adapter_cfg = {
             "fine_tune_type": "lora",
-            "num_layers": LORA_LAYERS,
+            "num_layers": args.lora_layers,
             "lora_parameters": {
-                "rank":    LORA_RANK,
-                "scale":   LORA_ALPHA / LORA_RANK,
+                "rank":    args.lora_rank,
+                "scale":   args.lora_alpha / args.lora_rank,
                 "dropout": 0.05,
             },
         }
@@ -244,7 +192,7 @@ def save_full_checkpoint(model, step):
         #    base model cache automatically.
         result = subprocess.run(
             [sys.executable, "-m", "mlx_lm.fuse",
-             "--model",        MODEL_NAME,
+             "--model",        args.model,
              "--adapter-path", tmp,
              "--save-path",    out_dir],
             capture_output=True, text=True,
@@ -263,9 +211,11 @@ def save_full_checkpoint(model, step):
 # ---------------------------------------------------------------------------
 
 def main():
+    args = parse_args()
+
     # ---- Load model --------------------------------------------------------
-    print(f"Loading {MODEL_NAME} ...")
-    model, tokenizer = load(MODEL_NAME)
+    print(f"Loading {args.model} ...")
+    model, tokenizer = load(args.model)
 
     # Qwen2.5 may not set a pad token; fall back to EOS.
     if tokenizer.pad_token_id is None:
@@ -274,33 +224,37 @@ def main():
     # ---- Apply LoRA --------------------------------------------------------
     model.freeze()
     lora_cfg = {
-        "rank":    LORA_RANK,
-        "scale":   LORA_ALPHA / LORA_RANK,  # effective per-layer scale
+        "rank":    args.lora_rank,
+        "scale":   args.lora_alpha / args.lora_rank,  # effective per-layer scale
         "dropout": 0.05,
     }
-    linear_to_lora_layers(model, num_layers=LORA_LAYERS, config=lora_cfg)
+    linear_to_lora_layers(model, num_layers=args.lora_layers, config=lora_cfg)
 
     trainable = list(tree_flatten(model.trainable_parameters()))
     n_trainable = sum(v.size for _, v in trainable)
-    print(f"LoRA applied: {n_trainable:,} trainable params across {len(trainable)} tensors")
+    print(f"LoRA applied: {n_trainable:,} trainable params across {len(trainable)} tensors ({args.lora_layers} layers, r={args.lora_rank})")
 
     # ---- Load and tokenise data --------------------------------------------
     print("Loading dataset ...")
-    samples = load_and_tokenise(tokenizer)
+    if args.dataset not in _DATASET_REGISTRY:
+        raise ValueError(f"Unknown dataset '{args.dataset}'. Supported: {list(_DATASET_REGISTRY.keys())}")
+    import importlib
+    build_dataloaders = importlib.import_module(_DATASET_REGISTRY[args.dataset]).build_dataloaders
+    train_loader, val_loader = build_dataloaders(tokenizer, args)
 
     # ---- Optimizer ---------------------------------------------------------
     # Initialise with peak LR; we override it each step during warmup.
-    optimizer = optim.AdamW(learning_rate=LR, weight_decay=0.01)
+    optimizer = optim.AdamW(learning_rate=args.lr, weight_decay=0.01)
 
     # Build the value-and-grad function once (cheaper than rebuilding each step).
     loss_and_grad = nn.value_and_grad(model, sft_loss)
 
     # ---- TensorBoard -------------------------------------------------------
-    writer = SummaryWriter(log_dir=TENSORBOARD_DIR)
-    print(f"TensorBoard logs -> {TENSORBOARD_DIR}  (run: tensorboard --logdir={TENSORBOARD_DIR})")
+    writer = SummaryWriter(log_dir=args.tensorboard_dir)
+    print(f"TensorBoard logs -> {args.tensorboard_dir}  (run: tensorboard --logdir={args.tensorboard_dir})")
 
     # ---- Training loop -----------------------------------------------------
-    print(f"\nTraining: {NUM_ITERS} steps | batch={BATCH_SIZE} | lr={LR} | lora_r={LORA_RANK}\n")
+    print(f"\nTraining: {args.num_iters} steps | batch={args.batch_size} | lr={args.lr} | lora_r={args.lora_rank}\n")
 
     step     = 0
     ema_loss = None
@@ -308,16 +262,18 @@ def main():
     t0       = time.time()
     t_log    = time.time()
 
-    data_iter = iterate_batches(samples, BATCH_SIZE, tokenizer.pad_token_id)
+    data_iter = itertools.chain.from_iterable(
+        itertools.repeat(train_loader)
+    )
 
-    while step < NUM_ITERS:
+    while step < args.num_iters:
         input_ids, loss_mask = next(data_iter)
 
-        # Linear warmup: ramp LR from 0 → peak over the first WARMUP_STEPS steps.
-        if step < WARMUP_STEPS:
-            optimizer.learning_rate = LR * (step + 1) / WARMUP_STEPS
+        # Linear warmup: ramp LR from 0 → peak over the first warmup_steps steps.
+        if step < args.warmup_steps:
+            optimizer.learning_rate = args.lr * (step + 1) / args.warmup_steps
         else:
-            optimizer.learning_rate = LR
+            optimizer.learning_rate = args.lr
 
         # Forward pass → loss + gradients in one call.
         (loss, ntoks), grads = loss_and_grad(model, input_ids, loss_mask)
@@ -344,9 +300,9 @@ def main():
         writer.add_scalar("train/learning_rate", lr_val,    step)
         writer.add_scalar("train/grad_norm",     gnorm_val, step)
 
-        if step % LOG_EVERY == 0:
+        if step % args.log_every == 0:
             dt    = time.time() - t_log
-            tok_s = ntoks.item() * LOG_EVERY / max(dt, 1e-8) if step > 0 else 0.0
+            tok_s = ntoks.item() * args.log_every / max(dt, 1e-8) if step > 0 else 0.0
             writer.add_scalar("train/tokens_per_sec", tok_s, step)
             print(
                 f"step {step:5d} | "
@@ -359,22 +315,28 @@ def main():
             t_log = time.time()
 
         # TensorBoard parameter histograms — logged less frequently.
-        if step % PARAM_LOG_EVERY == 0:
+        if step % args.param_log_every == 0:
             for name, param in tree_flatten(model.trainable_parameters()):
                 writer.add_histogram(f"params/{name}", np.array(param), step)
 
+        # ---- Validation ----------------------------------------------------
+        if step > 0 and step % args.eval_every == 0:
+            val_loss = evaluate(model, val_loader)
+            writer.add_scalar("val/loss", val_loss, step)
+            print(f"  [eval] step {step:5d} | val_loss {val_loss:.4f}")
+
         # ---- Checkpoint ----------------------------------------------------
-        if step > 0 and step % SAVE_EVERY == 0:
-            save_full_checkpoint(model, step)
+        if step > 0 and step % args.save_every == 0:
+            save_full_checkpoint(model, step, args)
 
         step += 1
 
     # Final checkpoint.
-    save_full_checkpoint(model, step)
+    save_full_checkpoint(model, step, args)
     writer.close()
     print(f"\nDone. Total time: {time.time() - t0:.1f}s")
-    print(f"Adapters saved to: {CHECKPOINT_DIR}/")
-    print(f"TensorBoard logs:  tensorboard --logdir={TENSORBOARD_DIR}")
+    print(f"Adapters saved to: {args.checkpoint_dir}/")
+    print(f"TensorBoard logs:  tensorboard --logdir={args.tensorboard_dir}")
 
 
 if __name__ == "__main__":
