@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument("--model",           type=str,   default="Qwen/Qwen2-0.5B-Instruct-MLX", help="HuggingFace model name or local path")
     parser.add_argument("--dataset",         type=str,   default="gsm8k",                         help="Dataset to use: gsm8k or magpie")
     parser.add_argument("--val-split",        type=float, default=0.1,                              help="Fraction of data held out for validation (0–1)")
-    parser.add_argument("--eval-every",       type=int,   default=100,                              help="Evaluate on validation set every N steps")
+    parser.add_argument("--eval-every",       type=int,   default=100,                              help="Evaluate on validation set every N steps. Set to -1 to disable.")
     parser.add_argument("--seed",             type=int,   default=42,                               help="Random seed for data shuffling and train/val split")
 
     # Training
@@ -268,6 +268,8 @@ def main():
 
     while step < args.num_iters:
         input_ids, loss_mask = next(data_iter)
+        input_ids = mx.array(input_ids.numpy(), dtype=mx.int32)
+        loss_mask = mx.array(loss_mask.numpy(), dtype=mx.float32)
 
         # Linear warmup: ramp LR from 0 → peak over the first warmup_steps steps.
         if step < args.warmup_steps:
@@ -320,7 +322,7 @@ def main():
                 writer.add_histogram(f"params/{name}", np.array(param), step)
 
         # ---- Validation ----------------------------------------------------
-        if step > 0 and step % args.eval_every == 0:
+        if args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
             val_loss = evaluate(model, val_loader)
             writer.add_scalar("val/loss", val_loss, step)
             pbar.write(f"  [eval] step {step:5d} | val_loss {val_loss:.4f}")

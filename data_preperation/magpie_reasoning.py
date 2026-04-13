@@ -12,11 +12,10 @@ even for large datasets.
 Public API
 ----------
 build_dataloaders(tokenizer, args) -> (train_loader, val_loader)
-    Returns two PyTorch DataLoaders whose batches are (mx.array, mx.array)
-    tuples of shape [B, T] ready for the MLX training loop.
+    Returns two PyTorch DataLoaders whose batches are (torch.Tensor, torch.Tensor)
+    tuples of shape [B, T] ready to be converted to the target accelerator format.
 """
 
-import mlx.core as mx
 import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset as hf_load_dataset
@@ -66,9 +65,8 @@ class MagpieReasoningDataset(Dataset):
         prompt_ids = self.tokenizer.encode(prompt_text)
         full_ids   = self.tokenizer.encode(full_text)[:self.max_seq_len]
 
-        prompt_len = min(len(prompt_ids), len(full_ids))
-        loss_mask  = [0] * prompt_len + [1] * (len(full_ids) - prompt_len)
-        loss_mask  = loss_mask[:self.max_seq_len]
+        prompt_len = min(len(prompt_ids), len(full_ids)) # In case the prompt itself exceeds max_seq_len, we treat all tokens as prompt. In that case, the loss_mask will be all zeros, and the collate_fn will filter out this sample from the batch.
+        loss_mask  = [0] * prompt_len + [1] * (len(full_ids) - prompt_len) # Response tokens get a loss mask of 1, prompt tokens get 0.
 
         return full_ids, loss_mask
 
@@ -80,8 +78,9 @@ class MagpieReasoningDataset(Dataset):
 def _make_collate_fn(pad_id):
     """
     Right-pads sequences within a batch to the same length and converts to
-    MLX arrays. Filters out any samples where no response token survived
-    truncation (loss_mask is all zeros).
+    torch.Tensor arrays. Filters out any samples where no response token survived
+    truncation (loss_mask is all zeros). Receives a batch 
+    of (input_ids, loss_mask) pairs
     """
     def collate_fn(batch):
         # Drop samples whose response was entirely truncated away.
@@ -94,6 +93,7 @@ def _make_collate_fn(pad_id):
         batch_msk = [item[1] for item in batch]
         max_len   = max(len(ids) for ids in batch_ids)
 
+        # Right-pad so that all sequences in the batch have the same length. 
         padded_ids, padded_masks = [], []
         for ids, mask in zip(batch_ids, batch_msk):
             pad = max_len - len(ids)
@@ -101,8 +101,8 @@ def _make_collate_fn(pad_id):
             padded_masks.append(mask + [0]     * pad)
 
         return (
-            mx.array(padded_ids,   dtype=mx.int32),
-            mx.array(padded_masks, dtype=mx.float32),
+            torch.tensor(padded_ids,   dtype=torch.int32),
+            torch.tensor(padded_masks, dtype=torch.float32),
         )
 
     return collate_fn
@@ -120,7 +120,7 @@ def build_dataloaders(tokenizer, args):
     backed, no Python loop). Tokenisation is deferred to batch time.
 
     Each batch yielded by the loaders is a tuple:
-        (input_ids: mx.array [B, T], loss_mask: mx.array [B, T])
+        (input_ids: torch.Tensor [B, T], loss_mask: torch.Tensor [B, T])
     """
     ds = hf_load_dataset(DATASET_NAME, split=DATASET_SPLIT)
 
