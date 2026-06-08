@@ -26,7 +26,7 @@ def main():
     )
     
     # Add <think> token to start generation
-    #formatted_prompt = formatted_prompt + "<think>\n"
+    formatted_prompt = formatted_prompt + "<think>\n"
     
     print("=== Formatted Prompt ===")
     print(formatted_prompt)
