@@ -1,4 +1,4 @@
-from mlx_lm import load, stream_generate
+from mlx_lm import load, stream_generate, generate
 from mlx_lm.sample_utils import make_sampler
 import mlx.optimizers as optim
 import mlx.core as mx
@@ -6,7 +6,7 @@ import mlx.nn as nn
 
 GROUP_SIZE   = 8
 MAX_NEW_TOK  = 20 # L
-LR           = 1e-4
+LR           = 1e-6
 KL_COEF      = 0.02
 CLIP_EPS     = 0.2
 PPO_EPOCHS   = 4 
@@ -71,16 +71,24 @@ def token_logprobs(model, prompt_tokens, input_ids, loss_mask):
     return final_logprobs * loss_mask
 
 def main():
-    policy, tokenizer = load("Qwen/Qwen2-0.5B-Instruct-MLX")
+    # Use the non-quantized checkpoint: the "-MLX" build is 4-bit quantized, so
+    # full-parameter GRPO can't train its packed weights. Cast to float32 so the
+    # AdamW eps (1e-8) doesn't underflow to 0 in fp16 (which produced nan after
+    # the first update) and so log_softmax/exp stay numerically stable.
+    policy, tokenizer = load("Qwen/Qwen2-0.5B-Instruct")
+    policy.set_dtype(mx.float32)
+    policy.train()
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     target_id = tokenizer.encode(TARGET_WORD)[0]
 
-    ref, _ = load("Qwen/Qwen2-0.5B-Instruct-MLX")
+    ref, _ = load("Qwen/Qwen2-0.5B-Instruct")
+    ref.set_dtype(mx.float32)
 
     optimizer = optim.AdamW(learning_rate=LR)
 
+    reward_history = []
     for step in range(STEPS):
         prompt = PROMPTS[step % len(PROMPTS)]
         prompt_tokens = mx.array(tokenizer.encode(prompt))  # [P]
@@ -99,6 +107,7 @@ def main():
             trajectories_tokens.append(tokens)
             trajectories_logprobs.append(logprobs)
 
+        
         # [G, L]
         (trajectories_tokens_padded,
         trajectories_logprobs_padded, 
@@ -109,15 +118,64 @@ def main():
  
         rewards = word_repetition_reward(trajectories_tokens_padded, target_id)
 
-        advantage = (rewards - rewards.mean()) / (rewards.std() + EPSILON)
+        advantage = (rewards - rewards.mean()) / (rewards.std() + EPSILON) # [G]
+        advantage = advantage[:, None] # [G, 1]
 
-        for _ in range(PPO_EPOCHS):
+        ref_logprobs = token_logprobs(
+            ref,
+            prompt_tokens,
+            trajectories_tokens_padded,
+            trajectories_masks_padded)
+
+        # The policy forward must run inside the differentiated function so
+        # value_and_grad can trace grads w.r.t. its params (MLX has no
+        # loss.backward()). Per-step constants are captured from the closure.
+        def grpo_loss(model):
             new_logprobs = token_logprobs(
-                policy,
-                prompt_tokens,
-                trajectories_tokens_padded,
-                trajectories_masks_padded)
-       
-            
+                model, prompt_tokens, trajectories_tokens_padded, trajectories_masks_padded)
+
+            ratio = mx.exp(new_logprobs - trajectories_logprobs_padded)
+            unclipped = ratio * advantage
+            clipped = mx.clip(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * advantage
+            surrogate = mx.minimum(unclipped, clipped)
+
+            kl = mx.exp(ref_logprobs - new_logprobs) - (ref_logprobs - new_logprobs) - 1
+            per_token = -(surrogate - KL_COEF * kl)
+
+            # Token-level mean over valid tokens keeps the gradient scale
+            # invariant to sequence length, so a fixed LR stays consistent.
+            return (per_token * trajectories_masks_padded).sum() / trajectories_masks_padded.sum()
+
+        loss_and_grad = nn.value_and_grad(policy, grpo_loss)
+
+        epoch_losses = []
+        for _ in range(PPO_EPOCHS):
+            loss, grads = loss_and_grad(policy)
+            # Clip the global grad norm: a single unconstrained update can move a
+            # token's logprob enough to blow up the k3 KL term (exp(ref - new)),
+            # which destabilizes training. Standard PPO/GRPO practice.
+            grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
+            optimizer.update(policy, grads)
+            mx.eval(policy.parameters(), optimizer.state)
+            epoch_losses.append(loss.item())
+
+        # One line per step. Mean reward is the real signal that the policy is
+        # learning; the PPO loss is averaged over the inner epochs for context.
+        # Per-step reward is noisy, so track a moving average to see the trend.
+        avg_loss = sum(epoch_losses) / len(epoch_losses)
+        reward_history.append(rewards.mean().item())
+        moving_avg = sum(reward_history[-10:]) / len(reward_history[-10:])
+        print(f"step {step:3d} | reward {reward_history[-1]:5.2f} | avg10 {moving_avg:5.2f} | loss {avg_loss:+.4f}")
+
+    print("=== sample after training ===")
+    text = generate(
+        policy,
+        tokenizer,
+        prompt=PROMPTS[0],
+        max_tokens=MAX_NEW_TOK,
+        sampler=make_sampler(temp=1.0, top_p=1.0),
+    )
+    print(text)
+
 if __name__ == "__main__":
     main()
