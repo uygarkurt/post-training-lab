@@ -1,30 +1,77 @@
+import argparse
+import itertools
+import os
+
 from mlx_lm import load, generate
+from mlx_lm.utils import save as save_model_checkpoint
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.models.cache import make_prompt_cache
 import mlx.optimizers as optim
 import mlx.core as mx
 import mlx.nn as nn
+from tensorboardX import SummaryWriter
 
-GROUP_SIZE   = 8
-MAX_NEW_TOK  = 20 # L
-LR           = 1e-6
-KL_COEF      = 0.02
-CLIP_EPS     = 0.2
-PPO_EPOCHS   = 4 
-STEPS        = 100
-TARGET_WORD  = " the" 
-EPSILON      = 1e-8
+import data_preperation.gsm8k_grpo as gsm8k_grpo
 
-PROMPTS = [
+DEBUG_PROMPTS = [
     "I think that",
     "The weather today is",
     "My favorite thing about life is",
     "Once upon a time",
 ]
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="GRPO training on MLX (Apple Silicon).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("--debug", action="store_true", help="Use toy prompts and word-repetition reward")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B-Instruct", help="HuggingFace model name or path")
+
+    parser.add_argument("--group-size", type=int, default=8, help="Number of rollouts per prompt (G)")
+    parser.add_argument("--max-new-tok", type=int, default=256, help="Max tokens to generate per rollout")
+    parser.add_argument("--lr", type=float, default=1e-6, help="AdamW learning rate")
+    parser.add_argument("--kl-coef", type=float, default=0.02, help="KL penalty coefficient")
+    parser.add_argument("--clip-eps", type=float, default=0.2, help="PPO clip epsilon")
+    parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO inner epochs per step")
+    parser.add_argument("--steps", type=int, default=100, help="Total training steps")
+    parser.add_argument("--target-word", type=str, default=" the", help="Target token for debug reward")
+    parser.add_argument("--epsilon", type=float, default=1e-8, help="Advantage normalisation epsilon")
+
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for data shuffle")
+    parser.add_argument("--val-split", type=float, default=0.1, help="Fraction held out from GSM8K train set")
+    parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
+
+    parser.add_argument("--tensorboard-dir", type=str, default="./runs/grpo", help="Directory for TensorBoard logs")
+
+    parser.add_argument("--save-steps", type=int, default=50, help="Save checkpoint every N steps (0 to disable)")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/grpo", help="Directory for checkpoints")
+
+    args = parser.parse_args()
+    if args.debug:
+        args.max_new_tok = 20
+    return args
+
+
 def word_repetition_reward(trajectory_tokens_padded, target_id):
     is_target = trajectory_tokens_padded == target_id
     return is_target.sum(axis=-1)  # [G]
+
+
+def gsm8k_answer_reward(trajectory_tokens, masks, tokenizer, ground_truth):
+    rewards = []
+    for g in range(trajectory_tokens.shape[0]):
+        valid_ids = [
+            int(t) for t, m in zip(trajectory_tokens[g].tolist(), masks[g].tolist())
+            if m == 1
+        ]
+        text = tokenizer.decode(valid_ids)
+        pred = gsm8k_grpo.extract_gsm8k_answer(text)
+        rewards.append(1.0 if pred == ground_truth else 0.0)
+    return mx.array(rewards, dtype=mx.float32)
+
 
 def batched_rollout(model, prompt_tokens, group_size, max_new_tok, sampler, tokenizer):
     prompt_batch = mx.repeat(prompt_tokens[None, :], group_size, axis=0) # [G, P]
@@ -33,61 +80,42 @@ def batched_rollout(model, prompt_tokens, group_size, max_new_tok, sampler, toke
     logits = model(prompt_batch, cache=cache)[:, -1, :] # [G, V]
 
     eos_id = tokenizer.eos_token_id
-    # `active[g]` is True while sequence g has not yet emitted EOS.
     active = mx.ones((group_size,), dtype=mx.bool_)
-   
-    # We collect one [G] array per decode step, then stack into [G, L] at the end.
+
     tokens_steps = []
     logprobs_steps = []
     masks_steps = []
     for _ in range(max_new_tok):
-        # Turn the current logits [G, V] into log-probabilities [G, V].
         lp = nn.log_softmax(logits, axis=-1)
-
-        # Sample the next token for every sequence at once -> [G].
         next_tok = sampler(lp)  # [G]
-
-        # Look up the log-prob the policy assigned to the token it sampled
         tok_logprob = lp[mx.arange(group_size), next_tok]   # [G]
 
-        # token, so an EOS token is itself valid (mask=1); tokens generated
-        # after a sequence's EOS get masked out after the loop.
-        masks_steps.append(active.astype(mx.int32))   
+        masks_steps.append(active.astype(mx.int32))
         tokens_steps.append(next_tok)
         logprobs_steps.append(tok_logprob)
 
-        # 7) Update `active`: a sequence stays active only if it did NOT just
-        #    emit EOS. Hint: combine the old `active` with (next_tok != eos_id).
-        active = active & (next_tok != eos_id) #[G] bool
-
+        active = active & (next_tok != eos_id)
         logits = model(next_tok[:, None], cache=cache)[:, -1, :]  # [G, V]
 
-    # Stack the per-step [G] arrays into [G, L].
     tokens = mx.stack(tokens_steps, axis=-1)    # [G, L]
     logprobs = mx.stack(logprobs_steps, axis=-1)  # [G, L]
     masks = mx.stack(masks_steps, axis=-1)     # [G, L]
 
- 
-    # Replace masked-out (post-EOS) positions with the pad token, and zero out their log-probs so they don't affect loss.
-    tokens = mx.where(masks == 1, tokens, tokenizer.pad_token_id) # [G, L] with padding in masked positions
-    logprobs = logprobs * masks # [G, L] with zeros in masked positions
+    tokens = mx.where(masks == 1, tokens, tokenizer.pad_token_id)
+    logprobs = logprobs * masks
     return tokens, logprobs, masks
+
 
 def token_logprobs(model, prompt_tokens, input_ids, loss_mask):
     G = input_ids.shape[0]
     P = prompt_tokens.shape[0]
 
-    # prompt_tokens[None, :] -> [1, P], unsqueeze(0)
     prompt_batch = mx.repeat(prompt_tokens[None, :], G, axis=0) # [G, P]
     full_ids = mx.concatenate([prompt_batch, input_ids], axis=-1) # [G, L+P]
 
     logits = model(full_ids) # [G, L+P, V]
     logprobs = nn.log_softmax(logits, axis=-1) # [G, L+P, V]
 
-    # logprobs[:, i, :] is the prediction for the token at position i+1.
-    # The last prompt token (row P-1) predicts the 1st generated token, so we
-    # keep its score. We drop the final row since it predicts a token past the
-    # end of the sequence, which has no target.
     gen_logprobs = logprobs[:, P-1:-1, :] # [G, L, V]
 
     g_ids = mx.expand_dims(mx.arange(G), axis=-1) # [G, 1]
@@ -96,41 +124,78 @@ def token_logprobs(model, prompt_tokens, input_ids, loss_mask):
 
     return final_logprobs * loss_mask
 
+
+def save_checkpoint(model, tokenizer, config, step, args):
+    """Save a full checkpoint loadable by mlx_lm.load()."""
+    out_dir = os.path.join(args.checkpoint_dir, f"step_{step:06d}")
+    os.makedirs(out_dir, exist_ok=True)
+    mx.eval(model.parameters())
+    save_model_checkpoint(out_dir, args.model, model, tokenizer, config, donate_model=False)
+    print(f"  checkpoint -> {out_dir}/  (load with: mlx_lm.load('{out_dir}'))")
+
+
 def main():
-    policy, tokenizer = load("Qwen/Qwen2-0.5B-Instruct")
+    args = parse_args()
+    mode = "debug" if args.debug else "gsm8k"
+    print(f"Mode: {mode} | max_new_tok={args.max_new_tok} | steps={args.steps}")
+
+    policy, tokenizer, config = load(args.model, return_config=True)
     policy.set_dtype(mx.float32)
     policy.train()
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    target_id = tokenizer.encode(TARGET_WORD)[0]
-
-    ref, _ = load("Qwen/Qwen2-0.5B-Instruct")
+    ref, _ = load(args.model)
     ref.set_dtype(mx.float32)
 
-    optimizer = optim.AdamW(learning_rate=LR)
+    optimizer = optim.AdamW(learning_rate=args.lr)
+
+    if args.debug:
+        target_id = tokenizer.encode(args.target_word)[0]
+        sample_prompt = DEBUG_PROMPTS[0]
+        data_iter = None
+    else:
+        print("Loading GSM8K dataset ...")
+        gsm8k_samples = gsm8k_grpo.build_grpo_samples(tokenizer, args)
+        data_iter = itertools.cycle(gsm8k_samples)
+
+    writer = SummaryWriter(log_dir=args.tensorboard_dir)
+    print(f"TensorBoard logs -> {args.tensorboard_dir}  (run: tensorboard --logdir={args.tensorboard_dir})")
 
     reward_history = []
-    for step in range(STEPS):
-        prompt = PROMPTS[step % len(PROMPTS)]
-        prompt_tokens = mx.array(tokenizer.encode(prompt))  # [P]
+    for step in range(args.steps):
+        if args.debug:
+            prompt = DEBUG_PROMPTS[step % len(DEBUG_PROMPTS)]
+            prompt_tokens = mx.array(tokenizer.encode(prompt))
+            ground_truth = None
+        else:
+            sample = next(data_iter)
+            prompt_tokens = mx.array(sample["prompt_ids"])
+            ground_truth = sample["ground_truth"]
 
         sampler = make_sampler(temp=1.0, top_p=1.0)
 
-        # [G, L]
         (trajectories_tokens_padded,
-        trajectories_logprobs_padded,
-        trajectories_masks_padded) = batched_rollout(
+         trajectories_logprobs_padded,
+         trajectories_masks_padded) = batched_rollout(
             policy,
             prompt_tokens,
-            GROUP_SIZE,
-            MAX_NEW_TOK,
+            args.group_size,
+            args.max_new_tok,
             sampler,
             tokenizer)
 
-        rewards = word_repetition_reward(trajectories_tokens_padded, target_id)
+        if args.debug:
+            rewards = word_repetition_reward(trajectories_tokens_padded, target_id)
+        else:
+            rewards = gsm8k_answer_reward(
+                trajectories_tokens_padded,
+                trajectories_masks_padded,
+                tokenizer,
+                ground_truth,
+            )
 
-        advantage = (rewards - rewards.mean()) / (rewards.std() + EPSILON) # [G]
+        advantage = (rewards - rewards.mean()) / (rewards.std() + args.epsilon) # [G]
         advantage = advantage[:, None] # [G, 1]
 
         ref_logprobs = token_logprobs(
@@ -139,55 +204,66 @@ def main():
             trajectories_tokens_padded,
             trajectories_masks_padded)
 
-        # The policy forward must run inside the differentiated function so
-        # value_and_grad can trace grads w.r.t. its params (MLX has no
-        # loss.backward()). Per-step constants are captured from the closure.
         def grpo_loss(model):
             new_logprobs = token_logprobs(
                 model, prompt_tokens, trajectories_tokens_padded, trajectories_masks_padded)
 
             ratio = mx.exp(new_logprobs - trajectories_logprobs_padded)
             unclipped = ratio * advantage
-            clipped = mx.clip(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * advantage
+            clipped = mx.clip(ratio, 1 - args.clip_eps, 1 + args.clip_eps) * advantage
             surrogate = mx.minimum(unclipped, clipped)
 
             kl = mx.exp(ref_logprobs - new_logprobs) - (ref_logprobs - new_logprobs) - 1
-            per_token = -(surrogate - KL_COEF * kl)
+            per_token = -(surrogate - args.kl_coef * kl)
 
-            # Token-level mean over valid tokens keeps the gradient scale
-            # invariant to sequence length, so a fixed LR stays consistent.
             return (per_token * trajectories_masks_padded).sum() / trajectories_masks_padded.sum()
 
         loss_and_grad = nn.value_and_grad(policy, grpo_loss)
 
         epoch_losses = []
-        for _ in range(PPO_EPOCHS):
+        for _ in range(args.ppo_epochs):
             loss, grads = loss_and_grad(policy)
-            # Clip the global grad norm: a single unconstrained update can move a
-            # token's logprob enough to blow up the k3 KL term (exp(ref - new)),
-            # which destabilizes training. Standard PPO/GRPO practice.
             grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
             optimizer.update(policy, grads)
             mx.eval(policy.parameters(), optimizer.state)
             epoch_losses.append(loss.item())
 
-        # One line per step. Mean reward is the real signal that the policy is
-        # learning; the PPO loss is averaged over the inner epochs for context.
-        # Per-step reward is noisy, so track a moving average to see the trend.
         avg_loss = sum(epoch_losses) / len(epoch_losses)
-        reward_history.append(rewards.mean().item())
+        reward_val = rewards.mean().item()
+        reward_history.append(reward_val)
         moving_avg = sum(reward_history[-10:]) / len(reward_history[-10:])
-        print(f"step {step:3d} | reward {reward_history[-1]:5.2f} | avg10 {moving_avg:5.2f} | loss {avg_loss:+.4f}")
+        adv_mean = advantage.squeeze().mean().item()
+        adv_std = advantage.squeeze().std().item()
 
-    print("=== sample after training ===")
-    text = generate(
-        policy,
-        tokenizer,
-        prompt=PROMPTS[0],
-        max_tokens=MAX_NEW_TOK,
-        sampler=make_sampler(temp=1.0, top_p=1.0),
-    )
-    print(text)
+        writer.add_scalar("train/loss", avg_loss, step)
+        writer.add_scalar("train/reward", reward_val, step)
+        writer.add_scalar("train/reward_avg10", moving_avg, step)
+        writer.add_scalar("train/advantage_mean", adv_mean, step)
+        writer.add_scalar("train/advantage_std", adv_std, step)
+
+        print(f"step {step:3d} | reward {reward_val:5.2f} | avg10 {moving_avg:5.2f} | "
+              f"loss {avg_loss:+.4f} | adv {adv_mean:+.3f}")
+
+        if args.save_steps > 0 and step > 0 and step % args.save_steps == 0:
+            print(f"  [ckpt] step {step:5d} | saving checkpoint ...")
+            save_checkpoint(policy, tokenizer, config, step, args)
+
+    writer.close()
+
+    if args.save_steps > 0:
+        save_checkpoint(policy, tokenizer, config, args.steps - 1, args)
+
+    if args.debug:
+        print("=== sample after training ===")
+        text = generate(
+            policy,
+            tokenizer,
+            prompt=sample_prompt,
+            max_tokens=args.max_new_tok,
+            sampler=make_sampler(temp=1.0, top_p=1.0),
+        )
+        print(text)
+
 
 if __name__ == "__main__":
     main()
