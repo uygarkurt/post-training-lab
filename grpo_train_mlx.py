@@ -1,5 +1,6 @@
-from mlx_lm import load, stream_generate, generate
+from mlx_lm import load, generate
 from mlx_lm.sample_utils import make_sampler
+from mlx_lm.models.cache import make_prompt_cache
 import mlx.optimizers as optim
 import mlx.core as mx
 import mlx.nn as nn
@@ -25,27 +26,52 @@ def word_repetition_reward(trajectory_tokens_padded, target_id):
     is_target = trajectory_tokens_padded == target_id
     return is_target.sum(axis=-1)  # [G]
 
-def pad_trajectories(
-    trajectories_tokens, 
-    trajectories_logprobs, 
-    tokenizer):
-    max_len = max(len(t) for t in trajectories_tokens)
-    trajectories_tokens_padded = []
-    trajectories_logprobs_padded = []
-    trajectories_masks_padded = []
-    for tokens, logprobs in zip(trajectories_tokens, trajectories_logprobs):
-        pad_len = max_len - len(tokens)
-        trajectories_tokens_padded.append(tokens + [tokenizer.pad_token_id] * pad_len)
-        trajectories_logprobs_padded.append(logprobs + [0.0] * pad_len)
-        trajectories_masks_padded.append([1] * len(tokens) + [0] * pad_len)
+def batched_rollout(model, prompt_tokens, group_size, max_new_tok, sampler, tokenizer):
+    prompt_batch = mx.repeat(prompt_tokens[None, :], group_size, axis=0) # [G, P]
 
-    trajectories_tokens_padded = mx.array(trajectories_tokens_padded) # [G, L]
-    trajectories_logprobs_padded = mx.array(trajectories_logprobs_padded) # [G, L]
-    trajectories_masks_padded = mx.array(trajectories_masks_padded) # [G, L]
+    cache = make_prompt_cache(model)
+    logits = model(prompt_batch, cache=cache)[:, -1, :] # [G, V]
 
-    return (trajectories_tokens_padded,
-            trajectories_logprobs_padded,
-            trajectories_masks_padded)
+    eos_id = tokenizer.eos_token_id
+    # `active[g]` is True while sequence g has not yet emitted EOS.
+    active = mx.ones((group_size,), dtype=mx.bool_)
+   
+    # We collect one [G] array per decode step, then stack into [G, L] at the end.
+    tokens_steps = []
+    logprobs_steps = []
+    masks_steps = []
+    for _ in range(max_new_tok):
+        # Turn the current logits [G, V] into log-probabilities [G, V].
+        lp = nn.log_softmax(logits, axis=-1)
+
+        # Sample the next token for every sequence at once -> [G].
+        next_tok = sampler(lp)  # [G]
+
+        # Look up the log-prob the policy assigned to the token it sampled
+        tok_logprob = lp[mx.arange(group_size), next_tok]   # [G]
+
+        # token, so an EOS token is itself valid (mask=1); tokens generated
+        # after a sequence's EOS get masked out after the loop.
+        masks_steps.append(active.astype(mx.int32))   
+        tokens_steps.append(next_tok)
+        logprobs_steps.append(tok_logprob)
+
+        # 7) Update `active`: a sequence stays active only if it did NOT just
+        #    emit EOS. Hint: combine the old `active` with (next_tok != eos_id).
+        active = active & (next_tok != eos_id) #[G] bool
+
+        logits = model(next_tok[:, None], cache=cache)[:, -1, :]  # [G, V]
+
+    # Stack the per-step [G] arrays into [G, L].
+    tokens = mx.stack(tokens_steps, axis=-1)    # [G, L]
+    logprobs = mx.stack(logprobs_steps, axis=-1)  # [G, L]
+    masks = mx.stack(masks_steps, axis=-1)     # [G, L]
+
+ 
+    # Replace masked-out (post-EOS) positions with the pad token, and zero out their log-probs so they don't affect loss.
+    tokens = mx.where(masks == 1, tokens, tokenizer.pad_token_id) # [G, L] with padding in masked positions
+    logprobs = logprobs * masks # [G, L] with zeros in masked positions
+    return tokens, logprobs, masks
 
 def token_logprobs(model, prompt_tokens, input_ids, loss_mask):
     G = input_ids.shape[0]
@@ -71,10 +97,6 @@ def token_logprobs(model, prompt_tokens, input_ids, loss_mask):
     return final_logprobs * loss_mask
 
 def main():
-    # Use the non-quantized checkpoint: the "-MLX" build is 4-bit quantized, so
-    # full-parameter GRPO can't train its packed weights. Cast to float32 so the
-    # AdamW eps (1e-8) doesn't underflow to 0 in fp16 (which produced nan after
-    # the first update) and so log_softmax/exp stay numerically stable.
     policy, tokenizer = load("Qwen/Qwen2-0.5B-Instruct")
     policy.set_dtype(mx.float32)
     policy.train()
@@ -93,29 +115,19 @@ def main():
         prompt = PROMPTS[step % len(PROMPTS)]
         prompt_tokens = mx.array(tokenizer.encode(prompt))  # [P]
 
-        trajectories_tokens = []
-        trajectories_logprobs = []
         sampler = make_sampler(temp=1.0, top_p=1.0)
-        for _ in range(GROUP_SIZE):
-            tokens = []
-            logprobs = []
-            for response in stream_generate(policy, tokenizer, prompt=prompt_tokens, max_tokens=MAX_NEW_TOK, sampler=sampler):
-                tokens.append(response.token)
-                logprobs.append(response.logprobs[response.token])
-                if response.finish_reason is not None:
-                    break
-            trajectories_tokens.append(tokens)
-            trajectories_logprobs.append(logprobs)
 
-        
         # [G, L]
         (trajectories_tokens_padded,
-        trajectories_logprobs_padded, 
-        trajectories_masks_padded) = pad_trajectories(
-            trajectories_tokens,
-            trajectories_logprobs,
+        trajectories_logprobs_padded,
+        trajectories_masks_padded) = batched_rollout(
+            policy,
+            prompt_tokens,
+            GROUP_SIZE,
+            MAX_NEW_TOK,
+            sampler,
             tokenizer)
- 
+
         rewards = word_repetition_reward(trajectories_tokens_padded, target_id)
 
         advantage = (rewards - rewards.mean()) / (rewards.std() + EPSILON) # [G]
