@@ -19,9 +19,17 @@ uv sync
 
 ### Debug (`--debug`)
 
-A fast smoke test with toy prompts and a word-repetition reward. The model is rewarded for generating a target token (default: `" the"`). `--max-new-tok` is automatically set to **20**.
+A fast algorithm smoke test that **overfits a tiny GSM8K subset** using the real answer-matching reward. By default **8 samples** (`--debug-samples`) are drawn from GSM8K; the **same set is used for training and validation**, so you should see `train/reward` and `val/reward` climb as the policy memorises those questions.
 
-At the end of training, a sample generation is printed so you can inspect the policy quickly.
+Recommended starting command:
+
+```bash
+uv run python grpo_train_mlx.py --debug --lr 1e-5 --eval-every 10 --num-iters 200
+```
+
+At the end of training, a sample generation is printed for the first debug question.
+
+For a minimal word-repetition toy (no GSM8K), use [`scripts/grpo_train_mlx_toy.py`](scripts/grpo_train_mlx_toy.py).
 
 ### Regular (default)
 
@@ -43,8 +51,8 @@ Checkpoints are fused into full model directories via `mlx_lm.fuse`, so they loa
 ## Usage
 
 ```bash
-# Debug smoke test
-uv run python grpo_train_mlx.py --debug
+# Debug overfit smoke test (tiny GSM8K subset, real reward)
+uv run python grpo_train_mlx.py --debug --lr 1e-5 --eval-every 10 --num-iters 200
 
 # Regular GSM8K training (defaults: 100 num-iters, max_new_tok=256)
 uv run python grpo_train_mlx.py
@@ -61,16 +69,16 @@ uv run python grpo_train_mlx.py \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--debug` | off | Toy prompts + word-repetition reward |
+| `--debug` | off | Overfit tiny GSM8K subset (same samples for train and val) |
+| `--debug-samples` | `8` | GSM8K samples used in `--debug` mode |
 | `--model` | `Qwen/Qwen2-0.5B-Instruct-MLX` | HuggingFace model name or local path |
 | `--group-size` | `8` | Rollouts per prompt (G) |
-| `--max-new-tok` | `256` | Max tokens per rollout (overridden to `20` in debug) |
+| `--max-new-tok` | `256` | Max tokens per rollout |
 | `--lr` | `1e-6` | AdamW learning rate |
 | `--kl-coef` | `0.02` | KL penalty coefficient |
 | `--clip-eps` | `0.2` | PPO clip epsilon |
 | `--ppo-epochs` | `4` | Inner PPO epochs per step |
 | `--num-iters` | `100` | Total gradient steps |
-| `--target-word` | `" the"` | Target token for debug reward |
 | `--epsilon` | `1e-8` | Advantage normalisation epsilon |
 | `--lora-rank` | `8` | LoRA rank (r) |
 | `--lora-alpha` | `16.0` | LoRA alpha (scale = alpha / rank) |
@@ -107,9 +115,9 @@ tensorboard --logdir=./runs/grpo
 
 ## Evaluation
 
-In regular (GSM8K) mode, the held-out validation split is evaluated every `--eval-every` steps (default 100). Each val question gets one greedy rollout (`temp=0`); the metric is mean answer accuracy (same binary reward as training), logged as `val/reward` in TensorBoard.
+In regular (GSM8K) mode, the held-out validation split is evaluated every `--eval-every` steps (default 100). In `--debug` mode, validation runs on the same tiny overfit set. Each val question gets one greedy rollout (`temp=0`); the metric is mean answer accuracy (same binary reward as training), logged as `val/reward` in TensorBoard.
 
-Evaluation is skipped in debug mode. Set `--eval-every -1` to disable during GSM8K runs.
+Set `--eval-every -1` to disable validation.
 
 ## Checkpoints
 

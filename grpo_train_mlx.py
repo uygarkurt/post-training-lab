@@ -21,13 +21,6 @@ from tqdm import tqdm
 
 import data_preperation.gsm8k_grpo as gsm8k_grpo
 
-DEBUG_PROMPTS = [
-    "I think that",
-    "The weather today is",
-    "My favorite thing about life is",
-    "Once upon a time",
-]
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -35,7 +28,14 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--debug", action="store_true", help="Use toy prompts and word-repetition reward")
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Overfit a tiny GSM8K subset (same samples for train and val; real answer reward)",
+    )
+    parser.add_argument(
+        "--debug-samples", type=int, default=8,
+        help="Number of GSM8K samples in --debug mode (train and val use the same set)",
+    )
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B-Instruct-MLX", help="HuggingFace model name or path")
 
     parser.add_argument("--group-size", type=int, default=8, help="Number of rollouts per prompt (G)")
@@ -45,7 +45,6 @@ def parse_args():
     parser.add_argument("--clip-eps", type=float, default=0.2, help="PPO clip epsilon")
     parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO inner epochs per step")
     parser.add_argument("--num-iters", type=int, default=500, help="Total gradient steps")
-    parser.add_argument("--target-word", type=str, default=" the", help="Target token for debug reward")
     parser.add_argument("--epsilon", type=float, default=1e-8, help="Advantage normalisation epsilon")
 
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank (r)")
@@ -66,14 +65,7 @@ def parse_args():
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/grpo", help="Directory for checkpoints")
 
     args = parser.parse_args()
-    if args.debug:
-        args.max_new_tok = 20
     return args
-
-
-def word_repetition_reward(trajectory_tokens_padded, target_id):
-    is_target = trajectory_tokens_padded == target_id
-    return is_target.sum(axis=-1)  # [G]
 
 
 def gsm8k_answer_reward(trajectory_tokens, masks, tokenizer, ground_truth):
@@ -237,16 +229,12 @@ def main():
     ref, _ = load(args.model)
 
     # ---- Load data ---------------------------------------------------------
+    print("Loading dataset ...")
     if args.debug:
-        target_id = tokenizer.encode(args.target_word)[0]
-        sample_prompt = DEBUG_PROMPTS[0]
-        data_iter = None
-        val_samples = None
+        gsm8k_train, val_samples = gsm8k_grpo.build_debug_overfit_samples(tokenizer, args)
     else:
-        print("Loading dataset ...")
-        gsm8k_train, gsm8k_val = gsm8k_grpo.build_grpo_samples(tokenizer, args)
-        data_iter = itertools.cycle(gsm8k_train)
-        val_samples = gsm8k_val
+        gsm8k_train, val_samples = gsm8k_grpo.build_grpo_samples(tokenizer, args)
+    data_iter = itertools.cycle(gsm8k_train)
 
     # ---- Optimizer ---------------------------------------------------------
     optimizer = optim.AdamW(learning_rate=args.lr)
@@ -270,13 +258,9 @@ def main():
     pbar = tqdm(total=args.num_iters, desc="train", unit="step", dynamic_ncols=True)
 
     while step < args.num_iters:
-        if args.debug:
-            prompt = DEBUG_PROMPTS[step % len(DEBUG_PROMPTS)]
-            prompt_tokens = mx.array(tokenizer.encode(prompt))
-        else:
-            sample = next(data_iter)
-            prompt_tokens = mx.array(sample["prompt_ids"])
-            ground_truth = sample["ground_truth"]
+        sample = next(data_iter)
+        prompt_tokens = mx.array(sample["prompt_ids"])
+        ground_truth = sample["ground_truth"]
 
         sampler = make_sampler(temp=1.0, top_p=1.0)
 
@@ -290,15 +274,12 @@ def main():
             sampler,
             tokenizer)
 
-        if args.debug:
-            rewards = word_repetition_reward(trajectories_tokens_padded, target_id)
-        else:
-            rewards = gsm8k_answer_reward(
-                trajectories_tokens_padded,
-                trajectories_masks_padded,
-                tokenizer,
-                ground_truth,
-            )
+        rewards = gsm8k_answer_reward(
+            trajectories_tokens_padded,
+            trajectories_masks_padded,
+            tokenizer,
+            ground_truth,
+        )
 
         advantage = (rewards - rewards.mean()) / (rewards.std() + args.epsilon)
         advantage = advantage[:, None]
@@ -368,8 +349,7 @@ def main():
                 writer.add_histogram(f"params/{name}", np.array(param), step)
 
         # ---- Validation ----------------------------------------------------
-        if (not args.debug and args.eval_every > 0
-                and step > 0 and step % args.eval_every == 0):
+        if args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
             val_reward = evaluate(policy, val_samples, tokenizer, args)
             writer.add_scalar("val/reward", val_reward, step)
             pbar.write(f"  [eval] step {step:5d} | val_reward {val_reward:.4f}")
@@ -388,16 +368,21 @@ def main():
 
     writer.close()
 
-    if args.debug:
-        print("=== sample after training ===")
+    if args.debug and val_samples:
+        sample = val_samples[0]
+        print("=== sample after training (first debug question) ===")
+        print(f"Q: {sample['question']}")
+        print(f"ground truth: {sample['ground_truth']}")
         text = generate(
             policy,
             tokenizer,
-            prompt=sample_prompt,
+            prompt=tokenizer.decode(sample["prompt_ids"]),
             max_tokens=args.max_new_tok,
             sampler=make_sampler(temp=1.0, top_p=1.0),
         )
-        print(text)
+        pred = gsm8k_grpo.extract_final_answer(text)
+        print(f"model output:\n{text}")
+        print(f"extracted answer: {pred}")
 
     print(f"\nDone. Total time: {time.time() - t0:.1f}s")
     print(f"Checkpoints saved to: {args.checkpoint_dir}/")
