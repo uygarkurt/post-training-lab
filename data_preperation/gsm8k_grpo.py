@@ -6,8 +6,8 @@ extracted from the dataset's #### final-answer format.
 
 Public API
 ----------
-build_grpo_samples(tokenizer, args) -> list[dict]
-    Returns shuffled train samples ready for the GRPO rollout loop.
+build_grpo_samples(tokenizer, args) -> tuple[list[dict], list[dict]]
+    Returns (train_samples, val_samples) ready for the GRPO rollout loop.
 """
 
 import random
@@ -20,20 +20,69 @@ DATASET_NAME   = "openai/gsm8k"
 DATASET_SUBSET = "socratic"
 DATASET_SPLIT  = "train"
 
-_ANSWER_RE = re.compile(r"####\s*([\d,.]+)")
+_ANSWER_RE = re.compile(r"####\s*([-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)")
+_NUMBER_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
+_ANSWER_IS_RE = re.compile(
+    r"(?:final\s+)?answer\s*(?:is|:)\s*([-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_number(raw: str) -> str:
+    s = raw.strip().replace(",", "")
+    if s.endswith("."):
+        s = s[:-1]
+    return s
 
 
 def extract_gsm8k_answer(text: str) -> str | None:
-    """Parse the final numeric answer after ####, stripping commas."""
+    """Parse the final numeric answer after #### (dataset ground truth)."""
     match = _ANSWER_RE.search(text)
     if match is None:
         return None
-    return match.group(1).replace(",", "")
+    return _normalize_number(match.group(1))
 
 
-def build_grpo_samples(tokenizer, args) -> list[dict]:
+def extract_final_answer(text: str) -> str | None:
     """
-    Tokenise GSM8K questions and return GRPO-ready train samples.
+    Extract a predicted final numeric answer from model output.
+
+    Tries, in order:
+      1. GSM8K #### marker
+      2. 'answer is X' / 'final answer: X' phrasing
+      3. Last number appearing anywhere in the text
+    """
+    if not text or not text.strip():
+        return None
+
+    match = _ANSWER_RE.search(text)
+    if match:
+        return _normalize_number(match.group(1))
+
+    match = _ANSWER_IS_RE.search(text)
+    if match:
+        return _normalize_number(match.group(1))
+
+    numbers = _NUMBER_RE.findall(text)
+    if numbers:
+        return _normalize_number(numbers[-1])
+
+    return None
+
+
+def answers_match(pred: str | None, ground_truth: str) -> bool:
+    """Return True if pred matches ground_truth (numeric compare when possible)."""
+    if pred is None:
+        return False
+    try:
+        return abs(float(pred) - float(ground_truth)) < 1e-5
+    except ValueError:
+        return pred == ground_truth
+
+
+def build_grpo_samples(tokenizer, args) -> tuple[list[dict], list[dict]]:
+    """
+    Tokenise GSM8K questions and return GRPO-ready train/val samples.
 
     Each sample is a dict:
         {"prompt_ids": List[int], "ground_truth": str, "question": str}
@@ -42,6 +91,10 @@ def build_grpo_samples(tokenizer, args) -> list[dict]:
     ----------
     tokenizer : HF tokenizer with apply_chat_template and encode.
     args      : parsed argparse.Namespace from grpo_train_mlx.py.
+
+    Returns
+    -------
+    (train, val) — two lists of sample dicts.
     """
     ds = hf_load_dataset(DATASET_NAME, DATASET_SUBSET, split=DATASET_SPLIT)
 
@@ -78,10 +131,11 @@ def build_grpo_samples(tokenizer, args) -> list[dict]:
     rng.shuffle(samples)
 
     n_val = max(1, int(len(samples) * args.val_split))
+    val   = samples[:n_val]
     train = samples[n_val:]
 
     print(f"  {len(samples)} samples loaded, {skipped} skipped  "
-          f"→  {len(train)} train / {n_val} val  "
+          f"→  {len(train)} train / {len(val)} val  "
           f"({args.val_split * 100:.0f}% val split).")
 
-    return train
+    return train, val
