@@ -68,10 +68,7 @@ def main():
     formatted_prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    
-    # Add <think> token to start generation
-    formatted_prompt = formatted_prompt + "<think>\n"
-    
+
     print("=== Formatted Prompt ===")
     print(formatted_prompt)
     
