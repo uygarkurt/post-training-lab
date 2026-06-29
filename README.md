@@ -122,7 +122,6 @@ Metrics are logged every step to `./runs/grpo`:
 | Scalar | Description |
 |--------|-------------|
 | `train/loss` | Mean PPO loss over inner epochs |
-| `train/loss_ema` | Exponential moving average of loss |
 | `train/learning_rate` | Current learning rate |
 | `train/tokens_per_sec` | Generated tokens per second (every `--log-every` steps) |
 | `train/reward` | Mean reward across the rollout group |

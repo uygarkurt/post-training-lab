@@ -259,8 +259,6 @@ def main():
     print(f"\nTraining: {args.num_iters} steps | batch={args.batch_size} | lr={args.lr} | lora_r={args.lora_rank}\n")
 
     step     = 0
-    ema_loss = None
-    ema_beta = 0.9
     tok_s    = 0.0
     t0       = time.time()
     t_log    = time.time()
@@ -299,11 +297,9 @@ def main():
         loss_val  = loss.item()
         gnorm_val = gnorm.item()
         lr_val    = float(optimizer.learning_rate)
-        ema_loss  = loss_val if ema_loss is None else ema_beta * ema_loss + (1 - ema_beta) * loss_val
 
         # TensorBoard scalars — logged every step.
         writer.add_scalar("train/loss",         loss_val,  step)
-        writer.add_scalar("train/loss_ema",      ema_loss,  step)
         writer.add_scalar("train/learning_rate", lr_val,    step)
         writer.add_scalar("train/grad_norm",     gnorm_val, step)
 
@@ -314,7 +310,7 @@ def main():
             t_log = time.time()
 
         pbar.set_postfix(
-            loss=f"{ema_loss:.4f}",
+            loss=f"{loss_val:.4f}",
             lr=f"{lr_val:.2e}",
             gnorm=f"{gnorm_val:.3f}",
             tok_s=f"{tok_s:.0f}",
