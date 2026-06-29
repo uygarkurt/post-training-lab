@@ -4,3 +4,6 @@ nanochat/
 runs/
 checkpoints/
 scripts/
+.claude/
+.cursor/
+.venv/
