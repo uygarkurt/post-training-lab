@@ -34,18 +34,17 @@ uv sync
 The pipeline is three scripts — supervised fine-tuning, then GRPO, then generation:
 
 ```bash
-# 1. SFT — LoRA fine-tune on GSM8K (saves fused model + adapters to checkpoints/sft/)
+# 1. SFT: LoRA fine-tune on GSM8K (saves fused model + adapters to checkpoints/sft/)
 uv run python sft_train_mlx.py
 
-# 2. GRPO — continue LoRA training from the SFT adapters with a reward signal
+# 2. GRPO: continue LoRA training from the SFT adapters with a reward signal
 uv run python grpo_train_mlx.py --model ./checkpoints/sft/step_000500 --load-adapter
 
 # 3. Generate from a checkpoint
 uv run python generate_text_mlx.py --model_path ./checkpoints/grpo/step_000050 --load-adapter
 ```
 
-Fast smoke test (no SFT needed) — overfit a tiny GSM8K subset with the real
-answer-matching reward; watch `train/reward` and `val/reward` climb to ~1.0:
+Fast smoke test (no SFT needed) overfit a tiny GSM8K subset with the real answer-matching reward.
 
 ```bash
 uv run python grpo_train_mlx.py --debug --lr 1e-5 --eval-every 10 --num-iters 200
