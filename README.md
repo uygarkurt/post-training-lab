@@ -75,6 +75,30 @@ post-training-lab/
 └── runs/                    # TensorBoard logs         (gitignored)
 ```
 
+## Citation
+
+If you use this software, please cite it:
+
+```bibtex
+@software{uygarkurt_2026_21111797,
+  author       = {uygarkurt},
+  title        = {uygarkurt/post-training-lab: v0.1.0},
+  month        = jul,
+  year         = 2026,
+  publisher    = {Zenodo},
+  version      = {v0.1.0},
+  doi          = {10.5281/zenodo.21111797},
+  url          = {https://doi.org/10.5281/zenodo.21111797},
+  swhid        = {swh:1:dir:347ae7d4023d5d6c28e84943b71de9b65e2aa721
+                   ;origin=https://doi.org/10.5281/zenodo.21111796;vi
+                   sit=swh:1:snp:4b6347ae5b75116e19830f6ac9d34825545c
+                   7235;anchor=swh:1:rel:fc0e838f97148d60ebcc320be26c
+                   f0a38a248686;path=uygarkurt-post-training-
+                   lab-449dadb
+                  },
+}
+```
+
 ## License
 
 [MIT](LICENSE)

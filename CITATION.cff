@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Post-Training Lab"
+authors:
+  - family-names: Kurt
+    given-names: Uygar
+version: v0.1.0
+date-released: 2026-07-01
+url: "https://github.com/uygarkurt/post-training-lab"
+doi: 10.5281/zenodo.21111797
