@@ -4,3 +4,8 @@ nanochat/
 runs/
 checkpoints/
 scripts/
+.claude/
+.cursor/
+.venv/
+final_models/
+notes.txt

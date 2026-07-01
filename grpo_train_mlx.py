@@ -4,14 +4,13 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 
 import numpy as np
 from mlx_lm import load, generate
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.tuner.utils import linear_to_lora_layers
+from mlx_lm.tuner.utils import linear_to_lora_layers, load_adapters
 import mlx.optimizers as optim
 import mlx.core as mx
 import mlx.nn as nn
@@ -37,9 +36,13 @@ def parse_args():
         help="Number of GSM8K samples in --debug mode (train and val use the same set)",
     )
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B-Instruct-MLX", help="HuggingFace model name or path")
+    parser.add_argument(
+        "--load-adapter", action="store_true",
+        help="Resume LoRA from SFT adapters in --model directory (requires adapters.safetensors + adapter_config.json)",
+    )
 
     parser.add_argument("--group-size", type=int, default=8, help="Number of rollouts per prompt (G)")
-    parser.add_argument("--max-new-tok", type=int, default=256, help="Max tokens to generate per rollout")
+    parser.add_argument("--max-new-tok", type=int, default=512, help="Max tokens to generate per rollout")
     parser.add_argument("--lr", type=float, default=1e-6, help="AdamW learning rate")
     parser.add_argument("--kl-coef", type=float, default=0.02, help="KL penalty coefficient")
     parser.add_argument("--clip-eps", type=float, default=0.2, help="PPO clip epsilon")
@@ -161,39 +164,69 @@ def evaluate(model, val_samples, tokenizer, args):
     return total_reward / len(val_samples)
 
 
+def read_adapter_config(adapter_dir):
+    config_path = os.path.join(adapter_dir, "adapter_config.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(
+            f"--load-adapter requires adapter_config.json in {adapter_dir}"
+        )
+    with open(config_path) as f:
+        return json.load(f)
+
+
+def apply_adapter_config_to_args(args, adapter_cfg):
+    """Sync LoRA hyperparameters from adapter_config.json onto args."""
+    lora_params = adapter_cfg["lora_parameters"]
+    saved_layers = adapter_cfg["num_layers"]
+    saved_rank = lora_params["rank"]
+    saved_alpha = lora_params["scale"] * saved_rank
+
+    if (args.lora_layers, args.lora_rank, args.lora_alpha) != (saved_layers, saved_rank, saved_alpha):
+        print(
+            "  Note: using LoRA config from adapter_config.json "
+            f"(layers={saved_layers}, rank={saved_rank}, alpha={saved_alpha}); "
+            "CLI --lora-* values ignored."
+        )
+
+    args.lora_layers = saved_layers
+    args.lora_rank = saved_rank
+    args.lora_alpha = saved_alpha
+
+
 def save_full_checkpoint(model, step, args):
     """
     Save a fully-merged checkpoint loadable by mlx_lm.load().
 
-    Writes adapter weights + adapter_config.json to a temp directory, then
-    calls mlx_lm.fuse to produce a complete model directory.
+    Writes adapter weights + adapter_config.json into the checkpoint directory,
+    then calls mlx_lm.fuse to produce a complete model directory. Adapters are
+    kept on disk for continued LoRA training.
     """
     out_dir = os.path.join(args.checkpoint_dir, f"step_{step:06d}")
     os.makedirs(out_dir, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-        mx.save_safetensors(os.path.join(tmp, "adapters.safetensors"), adapter_weights)
+    adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+    mx.save_safetensors(os.path.join(out_dir, "adapters.safetensors"), adapter_weights)
 
-        adapter_cfg = {
-            "fine_tune_type": "lora",
-            "num_layers": args.lora_layers,
-            "lora_parameters": {
-                "rank":    args.lora_rank,
-                "scale":   args.lora_alpha / args.lora_rank,
-                "dropout": 0.05,
-            },
-        }
-        with open(os.path.join(tmp, "adapter_config.json"), "w") as f:
-            json.dump(adapter_cfg, f, indent=2)
+    adapter_cfg = {
+        "fine_tune_type": "lora",
+        "base_model": args.base_model,
+        "num_layers": args.lora_layers,
+        "lora_parameters": {
+            "rank":    args.lora_rank,
+            "scale":   args.lora_alpha / args.lora_rank,
+            "dropout": 0.05,
+        },
+    }
+    with open(os.path.join(out_dir, "adapter_config.json"), "w") as f:
+        json.dump(adapter_cfg, f, indent=2)
 
-        result = subprocess.run(
-            [sys.executable, "-m", "mlx_lm.fuse",
-             "--model",        args.model,
-             "--adapter-path", tmp,
-             "--save-path",    out_dir],
-            capture_output=True, text=True,
-        )
+    result = subprocess.run(
+        [sys.executable, "-m", "mlx_lm.fuse",
+         "--model",        args.base_model,
+         "--adapter-path", out_dir,
+         "--save-path",    out_dir],
+        capture_output=True, text=True,
+    )
 
     if result.returncode != 0:
         print(f"  Warning: mlx_lm.fuse failed (step {step}):")
@@ -207,26 +240,58 @@ def main():
     args = parse_args()
 
     # ---- Load model --------------------------------------------------------
-    print(f"Loading {args.model} ...")
-    policy, tokenizer = load(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    if args.load_adapter:
+        adapter_dir = args.model
+        adapters_file = os.path.join(adapter_dir, "adapters.safetensors")
+        if not os.path.isfile(adapters_file):
+            raise FileNotFoundError(
+                f"--load-adapter requires adapters.safetensors in {adapter_dir}"
+            )
 
-    # ---- Apply LoRA --------------------------------------------------------
-    policy.freeze()
-    lora_cfg = {
-        "rank":    args.lora_rank,
-        "scale":   args.lora_alpha / args.lora_rank,
-        "dropout": 0.05,
-    }
-    linear_to_lora_layers(policy, num_layers=args.lora_layers, config=lora_cfg)
+        adapter_cfg = read_adapter_config(adapter_dir)
+        base_model = adapter_cfg.get("base_model")
+        if not base_model:
+            raise ValueError(
+                f"adapter_config.json in {adapter_dir} is missing 'base_model'"
+            )
+
+        args.base_model = base_model
+        apply_adapter_config_to_args(args, adapter_cfg)
+
+        print(f"Loading base model {base_model} ...")
+        policy, tokenizer = load(base_model)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        policy.freeze()
+        print(f"Loading SFT adapters from {adapter_dir} ...")
+        load_adapters(policy, adapter_dir)
+    else:
+        args.base_model = args.model
+        print(f"Loading {args.model} ...")
+        policy, tokenizer = load(args.model)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        policy.freeze()
+        lora_cfg = {
+            "rank":    args.lora_rank,
+            "scale":   args.lora_alpha / args.lora_rank,
+            "dropout": 0.05,
+        }
+        linear_to_lora_layers(policy, num_layers=args.lora_layers, config=lora_cfg)
 
     trainable = list(tree_flatten(policy.trainable_parameters()))
     n_trainable = sum(v.size for _, v in trainable)
     print(f"LoRA applied: {n_trainable:,} trainable params across {len(trainable)} tensors "
           f"({args.lora_layers} layers, r={args.lora_rank})")
 
-    ref, _ = load(args.model)
+    if args.load_adapter:
+        ref, _ = load(args.base_model)
+        ref.freeze()
+        load_adapters(ref, args.model)
+    else:
+        ref, _ = load(args.model)
 
     # ---- Load data ---------------------------------------------------------
     print("Loading dataset ...")
@@ -249,8 +314,6 @@ def main():
           f"lora_r={args.lora_rank} | mode={mode}\n")
 
     step     = 0
-    ema_loss = None
-    ema_beta = 0.9
     tok_s    = 0.0
     t0       = time.time()
     t_log    = time.time()
@@ -319,13 +382,11 @@ def main():
         # ---- Logging -------------------------------------------------------
         loss_val  = sum(epoch_losses) / len(epoch_losses)
         lr_val    = float(optimizer.learning_rate)
-        ema_loss  = loss_val if ema_loss is None else ema_beta * ema_loss + (1 - ema_beta) * loss_val
         reward_val = rewards.mean().item()
         adv_mean = advantage.squeeze().mean().item()
         adv_std = advantage.squeeze().std().item()
 
         writer.add_scalar("train/loss", loss_val, step)
-        writer.add_scalar("train/loss_ema", ema_loss, step)
         writer.add_scalar("train/learning_rate", lr_val, step)
         writer.add_scalar("train/reward", reward_val, step)
         writer.add_scalar("train/advantage_mean", adv_mean, step)
@@ -338,7 +399,7 @@ def main():
             t_log = time.time()
 
         pbar.set_postfix(
-            loss=f"{ema_loss:.4f}",
+            loss=f"{loss_val:.4f}",
             lr=f"{lr_val:.2e}",
             tok_s=f"{tok_s:.0f}",
         )

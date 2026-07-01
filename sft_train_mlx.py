@@ -18,7 +18,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 
 import numpy as np
@@ -69,11 +68,22 @@ def parse_args():
     # Logging / checkpointing
     parser.add_argument("--log-every",       type=int,   default=10,    help="Print loss + TensorBoard scalars every N steps")
     parser.add_argument("--save-every",      type=int,   default=100,   help="Save adapter checkpoint every N steps")
-    parser.add_argument("--checkpoint-dir",  type=str,   default="./checkpoints", help="Directory for checkpoints")
-    parser.add_argument("--tensorboard-dir", type=str,   default="./runs",        help="Directory for TensorBoard logs")
+    parser.add_argument("--checkpoint-dir",  type=str,   default="./checkpoints/sft", help="Directory for checkpoints")
+    parser.add_argument("--tensorboard-dir", type=str,   default="./runs/sft",    help="Directory for TensorBoard logs")
     parser.add_argument("--param-log-every", type=int,   default=50,    help="Log LoRA parameter histograms every N steps")
 
     return parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Batch conversion
+# ---------------------------------------------------------------------------
+
+def to_mlx_batch(x, dtype):
+    """Convert a dataloader batch item to an MLX array (handles mlx or torch)."""
+    if isinstance(x, mx.array):
+        return x
+    return mx.array(x.numpy(), dtype=dtype)
+
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -89,6 +99,8 @@ def evaluate(model, val_loader):
     total_toks = 0
 
     for input_ids, loss_mask in tqdm(val_loader, desc="  eval", leave=False, unit="batch"):
+        input_ids = to_mlx_batch(input_ids, mx.int32)
+        loss_mask = to_mlx_batch(loss_mask, mx.float32)
         loss, ntoks = sft_loss(model, input_ids, loss_mask)
         mx.eval(loss, ntoks)
 
@@ -151,10 +163,10 @@ def save_full_checkpoint(model, step, args):
     """
     Save a fully-merged checkpoint loadable by mlx_lm.load().
 
-    Writes adapter weights + adapter_config.json to a temp directory, then
-    calls `mlx_lm.fuse` (same approach as mlx-tune's SFTTrainer) to produce
-    a complete model directory with model.safetensors, config.json, and all
-    tokenizer files copied from the base model.
+    Writes adapter weights + adapter_config.json into the checkpoint directory,
+    then calls `mlx_lm.fuse` to produce a complete model directory with
+    model.safetensors, config.json, and all tokenizer files copied from the
+    base model. Adapters are kept on disk for GRPO resume via --load-adapter.
 
     The live training model is NOT modified — fusing happens inside the
     subprocess on a fresh model load.
@@ -162,36 +174,29 @@ def save_full_checkpoint(model, step, args):
     out_dir = os.path.join(args.checkpoint_dir, f"step_{step:06d}")
     os.makedirs(out_dir, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        # 1. Dump current LoRA adapter weights.
-        adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-        mx.save_safetensors(os.path.join(tmp, "adapters.safetensors"), adapter_weights)
+    adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+    mx.save_safetensors(os.path.join(out_dir, "adapters.safetensors"), adapter_weights)
 
-        # 2. Write adapter_config.json — required by mlx_lm.fuse.
-        #    num_layers must be a top-level key; mlx_lm reads it as
-        #    config.num_layers (SimpleNamespace) before applying LoRA layers.
-        adapter_cfg = {
-            "fine_tune_type": "lora",
-            "num_layers": args.lora_layers,
-            "lora_parameters": {
-                "rank":    args.lora_rank,
-                "scale":   args.lora_alpha / args.lora_rank,
-                "dropout": 0.05,
-            },
-        }
-        with open(os.path.join(tmp, "adapter_config.json"), "w") as f:
-            json.dump(adapter_cfg, f, indent=2)
+    adapter_cfg = {
+        "fine_tune_type": "lora",
+        "base_model": args.model,
+        "num_layers": args.lora_layers,
+        "lora_parameters": {
+            "rank":    args.lora_rank,
+            "scale":   args.lora_alpha / args.lora_rank,
+            "dropout": 0.05,
+        },
+    }
+    with open(os.path.join(out_dir, "adapter_config.json"), "w") as f:
+        json.dump(adapter_cfg, f, indent=2)
 
-        # 3. Fuse adapters into the base model and write the full checkpoint.
-        #    mlx_lm.fuse copies config.json, tokenizer.json, etc. from the
-        #    base model cache automatically.
-        result = subprocess.run(
-            [sys.executable, "-m", "mlx_lm.fuse",
-             "--model",        args.model,
-             "--adapter-path", tmp,
-             "--save-path",    out_dir],
-            capture_output=True, text=True,
-        )
+    result = subprocess.run(
+        [sys.executable, "-m", "mlx_lm.fuse",
+         "--model",        args.model,
+         "--adapter-path", out_dir,
+         "--save-path",    out_dir],
+        capture_output=True, text=True,
+    )
 
     if result.returncode != 0:
         print(f"  Warning: mlx_lm.fuse failed (step {step}):")
@@ -254,8 +259,6 @@ def main():
     print(f"\nTraining: {args.num_iters} steps | batch={args.batch_size} | lr={args.lr} | lora_r={args.lora_rank}\n")
 
     step     = 0
-    ema_loss = None
-    ema_beta = 0.9
     tok_s    = 0.0
     t0       = time.time()
     t_log    = time.time()
@@ -268,8 +271,8 @@ def main():
 
     while step < args.num_iters:
         input_ids, loss_mask = next(data_iter)
-        input_ids = mx.array(input_ids.numpy(), dtype=mx.int32)
-        loss_mask = mx.array(loss_mask.numpy(), dtype=mx.float32)
+        input_ids = to_mlx_batch(input_ids, mx.int32)
+        loss_mask = to_mlx_batch(loss_mask, mx.float32)
 
         # Linear warmup: ramp LR from 0 → peak over the first warmup_steps steps.
         if step < args.warmup_steps:
@@ -294,11 +297,9 @@ def main():
         loss_val  = loss.item()
         gnorm_val = gnorm.item()
         lr_val    = float(optimizer.learning_rate)
-        ema_loss  = loss_val if ema_loss is None else ema_beta * ema_loss + (1 - ema_beta) * loss_val
 
         # TensorBoard scalars — logged every step.
         writer.add_scalar("train/loss",         loss_val,  step)
-        writer.add_scalar("train/loss_ema",      ema_loss,  step)
         writer.add_scalar("train/learning_rate", lr_val,    step)
         writer.add_scalar("train/grad_norm",     gnorm_val, step)
 
@@ -309,7 +310,7 @@ def main():
             t_log = time.time()
 
         pbar.set_postfix(
-            loss=f"{ema_loss:.4f}",
+            loss=f"{loss_val:.4f}",
             lr=f"{lr_val:.2e}",
             gnorm=f"{gnorm_val:.3f}",
             tok_s=f"{tok_s:.0f}",

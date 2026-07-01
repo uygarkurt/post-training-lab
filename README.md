@@ -44,9 +44,30 @@ Answer extraction tries `####`, phrases like "answer is X", then the last number
 
 ## LoRA
 
-Training uses LoRA (same setup as SFT): the base model weights are frozen, LoRA adapters are applied to the last N transformer layers, and only the adapter weights are updated. The reference model used for the KL penalty is the unmodified base model.
+Training uses LoRA (same setup as SFT): the base model weights are frozen, LoRA adapters are applied to the last N transformer layers, and only the adapter weights are updated.
 
-Checkpoints are fused into full model directories via `mlx_lm.fuse`, so they load directly with `mlx_lm.load()` — no separate adapter path needed.
+- **Without `--load-adapter`:** the reference model for the KL penalty is the unmodified base model.
+- **With `--load-adapter`:** the reference model is the SFT policy (base + loaded adapters, frozen).
+
+Checkpoints are fused into full model directories via `mlx_lm.fuse`, so they load directly with `mlx_lm.load()` for inference. Each checkpoint also keeps `adapters.safetensors` and `adapter_config.json` on disk for continued LoRA training.
+
+## SFT → GRPO workflow
+
+Run SFT first ([`sft_train_mlx.py`](sft_train_mlx.py)); checkpoints are saved under `./checkpoints/sft/step_{step}/` with both a fused model and adapter files.
+
+Then resume those adapters in GRPO by pointing `--model` at the SFT step directory and enabling `--load-adapter`:
+
+```bash
+# 1. SFT (saves fused model + adapters to checkpoints/sft/)
+uv run python sft_train_mlx.py
+
+# 2. GRPO — continue LoRA training from SFT adapters
+uv run python grpo_train_mlx.py \
+  --model ./checkpoints/sft/step_000500 \
+  --load-adapter
+```
+
+When `--load-adapter` is set, `--model` must be an SFT checkpoint directory containing `adapters.safetensors` and `adapter_config.json`. The unfused base model is read from `base_model` in that config; LoRA hyperparameters are taken from the adapter config, not CLI `--lora-*` flags.
 
 ## Usage
 
@@ -71,7 +92,8 @@ uv run python grpo_train_mlx.py \
 |------|---------|-------------|
 | `--debug` | off | Overfit tiny GSM8K subset (same samples for train and val) |
 | `--debug-samples` | `8` | GSM8K samples used in `--debug` mode |
-| `--model` | `Qwen/Qwen2-0.5B-Instruct-MLX` | HuggingFace model name or local path |
+| `--model` | `Qwen/Qwen2-0.5B-Instruct-MLX` | HuggingFace model name or path; with `--load-adapter`, path to an SFT step directory |
+| `--load-adapter` | off | Resume LoRA from SFT adapters in `--model` directory |
 | `--group-size` | `8` | Rollouts per prompt (G) |
 | `--max-new-tok` | `256` | Max tokens per rollout |
 | `--lr` | `1e-6` | AdamW learning rate |
@@ -100,7 +122,6 @@ Metrics are logged every step to `./runs/grpo`:
 | Scalar | Description |
 |--------|-------------|
 | `train/loss` | Mean PPO loss over inner epochs |
-| `train/loss_ema` | Exponential moving average of loss |
 | `train/learning_rate` | Current learning rate |
 | `train/tokens_per_sec` | Generated tokens per second (every `--log-every` steps) |
 | `train/reward` | Mean reward across the rollout group |
@@ -121,7 +142,7 @@ Set `--eval-every -1` to disable validation.
 
 ## Checkpoints
 
-Checkpoints are saved to `./checkpoints/grpo/step_{step:06d}/` every `--save-every` steps, plus a final save at the end of training. LoRA adapters are fused into a full model directory via `mlx_lm.fuse`, loadable by mlx-lm:
+Checkpoints are saved to `./checkpoints/grpo/step_{step:06d}/` every `--save-every` steps, plus a final save at the end of training. Each directory contains a fused model (loadable by mlx-lm) plus `adapters.safetensors` and `adapter_config.json` for continued LoRA training:
 
 ```python
 from mlx_lm import load, generate
@@ -133,9 +154,11 @@ print(generate(model, tokenizer, prompt="I think that"))
 ## Project layout
 
 ```
+sft_train_mlx.py               # SFT training script (checkpoints/sft/)
 grpo_train_mlx.py              # GRPO training script
 data_preperation/
   gsm8k_grpo.py                # GSM8K prompt loading + answer extraction
-checkpoints/grpo/              # Saved model checkpoints (gitignored)
-runs/grpo/                     # TensorBoard logs (gitignored)
+checkpoints/sft/               # SFT checkpoints (gitignored)
+checkpoints/grpo/              # GRPO checkpoints (gitignored)
+runs/                          # TensorBoard logs (gitignored)
 ```
