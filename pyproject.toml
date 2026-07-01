@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "datasets>=4.8.4",
+    "lm-eval>=0.4.12",
     "mlx>=0.31.1",
     "mlx-lm>=0.31.2",
     "setuptools==81.0.0",

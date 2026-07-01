@@ -42,7 +42,7 @@ def parse_args():
     )
 
     parser.add_argument("--group-size", type=int, default=8, help="Number of rollouts per prompt (G)")
-    parser.add_argument("--max-new-tok", type=int, default=256, help="Max tokens to generate per rollout")
+    parser.add_argument("--max-new-tok", type=int, default=512, help="Max tokens to generate per rollout")
     parser.add_argument("--lr", type=float, default=1e-6, help="AdamW learning rate")
     parser.add_argument("--kl-coef", type=float, default=0.02, help="KL penalty coefficient")
     parser.add_argument("--clip-eps", type=float, default=0.2, help="PPO clip epsilon")
