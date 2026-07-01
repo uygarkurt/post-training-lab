@@ -31,8 +31,7 @@ from mlx_lm.tuner.utils import linear_to_lora_layers
 
 from tensorboardX import SummaryWriter
 
-import data_preperation.gsm8k as _gsm8k_data
-import data_preperation.magpie_reasoning as _magpie_data
+import data_preparation.gsm8k as _gsm8k_data
 
 
 
@@ -48,7 +47,7 @@ def parse_args():
 
     # Model / data
     parser.add_argument("--model",           type=str,   default="Qwen/Qwen2-0.5B-Instruct-MLX", help="HuggingFace model name or local path")
-    parser.add_argument("--dataset",         type=str,   default="gsm8k",                         help="Dataset to use: gsm8k or magpie")
+    parser.add_argument("--dataset",         type=str,   default="gsm8k",                         help="Dataset to use: gsm8k")
     parser.add_argument("--val-split",        type=float, default=0.1,                              help="Fraction of data held out for validation (0–1)")
     parser.add_argument("--eval-every",       type=int,   default=100,                              help="Evaluate on validation set every N steps. Set to -1 to disable.")
     parser.add_argument("--seed",             type=int,   default=42,                               help="Random seed for data shuffling and train/val split")
@@ -238,10 +237,8 @@ def main():
     print("Loading dataset ...")
     if args.dataset == "gsm8k":
         build_dataloaders = _gsm8k_data.build_dataloaders
-    elif args.dataset == "magpie":
-        build_dataloaders = _magpie_data.build_dataloaders
     else:
-        raise ValueError(f"Unknown dataset '{args.dataset}'. Choose from: gsm8k, magpie")
+        raise ValueError(f"Unknown dataset '{args.dataset}'. Choose from: gsm8k")
     train_loader, val_loader = build_dataloaders(tokenizer, args)
 
     # ---- Optimizer ---------------------------------------------------------

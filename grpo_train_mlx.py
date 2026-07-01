@@ -18,7 +18,7 @@ from mlx.utils import tree_flatten
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
-import data_preperation.gsm8k_grpo as gsm8k_grpo
+import data_preparation.gsm8k_grpo as gsm8k_grpo
 
 
 def parse_args():
