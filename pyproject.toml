@@ -9,13 +9,17 @@ authors = [{ name = "Uygar Kurt" }]
 keywords = ["post-training", "sft", "grpo", "rlhf", "lora", "mlx"]
 dependencies = [
     "datasets>=4.8.4",
-    "mlx>=0.31.1",
-    "mlx-lm>=0.31.2",
     "numpy>=2.0",
     "tensorboard>=2.20.0",
     "tensorboardx>=2.6.5",
     "torch>=2.11.0",
     "tqdm>=4.67.3",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.31.1",
+    "mlx-lm>=0.31.2",
 ]
 
 [project.urls]

@@ -18,7 +18,7 @@ from mlx.utils import tree_flatten
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
-import data_preparation.gsm8k_grpo as gsm8k_grpo
+from data_preparation import gsm8k
 
 
 def parse_args():
@@ -62,10 +62,10 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=10, help="Log tokens/sec to TensorBoard every N steps")
     parser.add_argument("--param-log-every", type=int, default=50, help="Log LoRA parameter histograms every N steps")
 
-    parser.add_argument("--tensorboard-dir", type=str, default="./runs/grpo", help="Directory for TensorBoard logs")
+    parser.add_argument("--tensorboard-dir", type=str, default="./runs/mlx/grpo", help="Directory for TensorBoard logs")
 
     parser.add_argument("--save-every", type=int, default=100, help="Save adapter checkpoint every N steps (0 to disable)")
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/grpo", help="Directory for checkpoints")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/mlx/grpo", help="Directory for checkpoints")
 
     args = parser.parse_args()
     return args
@@ -79,8 +79,8 @@ def gsm8k_answer_reward(trajectory_tokens, masks, tokenizer, ground_truth):
             if m == 1
         ]
         text = tokenizer.decode(valid_ids)
-        pred = gsm8k_grpo.extract_final_answer(text)
-        rewards.append(1.0 if gsm8k_grpo.answers_match(pred, ground_truth) else 0.0)
+        pred = gsm8k.extract_final_answer(text)
+        rewards.append(1.0 if gsm8k.answers_match(pred, ground_truth) else 0.0)
     return mx.array(rewards, dtype=mx.float32)
 
 
@@ -296,9 +296,19 @@ def main():
     # ---- Load data ---------------------------------------------------------
     print("Loading dataset ...")
     if args.debug:
-        gsm8k_train, val_samples = gsm8k_grpo.build_debug_overfit_samples(tokenizer, args)
+        gsm8k_train, val_samples = gsm8k.build_debug_overfit_samples(
+            tokenizer,
+            max_prompt_len=args.max_prompt_len,
+            seed=args.seed,
+            debug_samples=args.debug_samples,
+        )
     else:
-        gsm8k_train, val_samples = gsm8k_grpo.build_grpo_samples(tokenizer, args)
+        gsm8k_train, val_samples = gsm8k.build_grpo_samples(
+            tokenizer,
+            max_prompt_len=args.max_prompt_len,
+            val_split=args.val_split,
+            seed=args.seed,
+        )
     data_iter = itertools.cycle(gsm8k_train)
 
     # ---- Optimizer ---------------------------------------------------------
@@ -441,7 +451,7 @@ def main():
             max_tokens=args.max_new_tok,
             sampler=make_sampler(temp=1.0, top_p=1.0),
         )
-        pred = gsm8k_grpo.extract_final_answer(text)
+        pred = gsm8k.extract_final_answer(text)
         print(f"model output:\n{text}")
         print(f"extracted answer: {pred}")
 

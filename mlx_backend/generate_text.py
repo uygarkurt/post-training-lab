@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-Simple text generation script using MLX models.
-"""
+"""Simple text generation entrypoint for the MLX backend."""
 
 import argparse
 import json

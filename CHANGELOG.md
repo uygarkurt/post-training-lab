@@ -9,14 +9,14 @@ API may change between minor versions.
 First public release.
 
 ### Added
-- SFT training script ([`sft_train_mlx.py`](sft_train_mlx.py)) — LoRA fine-tuning
+- SFT training script ([`sft_train.py`](mlx_backend/sft_train.py)) — LoRA fine-tuning
   on GSM8K (chain-of-thought).
-- GRPO training script ([`grpo_train_mlx.py`](grpo_train_mlx.py)) — group-relative
+- GRPO training script ([`grpo_train.py`](mlx_backend/grpo_train.py)) — group-relative
   policy optimization with a clipped surrogate objective and KL penalty against a
   frozen reference, with a `--debug` overfit sanity-check mode.
 - SFT → GRPO resume via `--load-adapter` (continue LoRA training from SFT
   adapters; reference model becomes the SFT policy).
-- Text generation script ([`generate_text_mlx.py`](generate_text_mlx.py)) for
+- Text generation script ([`generate_text.py`](mlx_backend/generate_text.py)) for
   base models or fused/adapter checkpoints.
 - Data preparation for GSM8K ([`data_preparation/`](data_preparation/)).
 - TensorBoard logging and fused checkpoints loadable by `mlx_lm.load()`.

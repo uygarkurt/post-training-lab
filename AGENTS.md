@@ -47,6 +47,25 @@ multiple abstraction layers.
   between MLX and CUDA.
 - Do not modify generated checkpoints or TensorBoard runs.
 
+## Backend structure and parity
+
+- Keep runnable implementations in `cuda_backend/` and `mlx_backend/`.
+- Keep dataset preparation backend-neutral in `data_preparation/`. It owns
+  dataset creation, tokenization, splitting, PyTorch `Dataset`/`DataLoader`,
+  padding, and batching.
+- Shared data code may return plain Python samples or PyTorch tensors, but it
+  must not import MLX or perform backend-specific device/model operations.
+- Keep MLX tensor conversion, devices, model operations, losses, and
+  optimization in `mlx_backend/`; keep their CUDA equivalents in
+  `cuda_backend/`.
+- Implement new algorithms and major algorithm changes in CUDA first, then
+  mirror them in MLX without changing the shared data contract.
+- Keep corresponding backend filenames, CLI options, section order, variable
+  names, and mathematical steps aligned where practical.
+- Prefer structural parity over literal line-for-line identity. Use native
+  PyTorch and MLX operations when that makes each implementation clearer.
+- Do not change shared data code solely to accommodate one backend.
+
 ## Verification
 
 - Run focused, inexpensive checks where possible.
