@@ -1,6 +1,9 @@
 import argparse
 import copy
+import os
+import random
 
+import numpy as np
 import torch
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -47,7 +50,7 @@ def parse_args():
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank (r)")
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha (scale = alpha / rank)")
 
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for data shuffle")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization, data shuffle, and rollout sampling")
     parser.add_argument("--val-split", type=float, default=0.1, help="Fraction held out from GSM8K train set")
     parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
     parser.add_argument("--eval-every", type=int, default=100, help="Evaluate on validation set every N steps (-1 to disable)")
@@ -62,6 +65,17 @@ def parse_args():
 
     args = parser.parse_args()
     return args
+
+
+def set_random_seed(seed):
+    """Seed all RNGs and require deterministic CUDA algorithms."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
 
 
 def load_policy_and_reference(args):
@@ -176,23 +190,37 @@ def generate_rollouts(policy, prompt_ids, group_size, max_new_tok, tokenizer):
             use_cache=True) # [G, P + L]
     policy.train()
 
-    prompt_length = prompt_tensor.shape[1]
-    completion_ids = generated_ids[:, prompt_length:]
+    print(generated_ids.shape)
+
+    prompt_length = prompt_tensor.shape[1] # P
+    completion_ids = generated_ids[:, prompt_length:] # [G, L]
 
     # Works for Qwen. It produces EOS afet generation ands. Fills the rest with PAD.
     is_eos_or_pad = (completion_ids.eq(tokenizer.eos_token_id) | completion_ids.eq(tokenizer.pad_token_id))
 
     # We have to include the first EOS token
-    completion_mask = (is_eos_or_pad.cumsum(dim=-1) <= 1).long()
-    
+    completion_mask = (is_eos_or_pad.cumsum(dim=-1) <= 1).long() # [G, L]
+
     return completion_ids, completion_mask
+
+
+    # def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
+    #     complete_ids = prompt_ids.repeat()
+
 
 def main():
     args = parse_args()
+    set_random_seed(args.seed)
     policy, reference, tokenizer = load_policy_and_reference(args)
     train_samples, val_samples = load_grpo_dataset(tokenizer, args)
 
-    rollouts = generate_rollouts(policy, train_samples[0]['prompt_ids'], args.group_size, args.max_new_tok, tokenizer)
+    for step, sample in enumerate(train_samples):
+        if step >= args.num_iters:
+            break
+
+        rollouts, rollout_masks = generate_rollouts(policy, sample['prompt_ids'], args.group_size, args.max_new_tok, tokenizer) # [G, L], [G, L]
+
+        break
 
 if __name__ == "__main__":
     main()
