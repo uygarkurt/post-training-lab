@@ -18,6 +18,9 @@ build_grpo_samples(...)
 
 build_debug_overfit_samples(...)
     Return matching tiny train/validation lists for GRPO smoke tests.
+
+answer_rewards(...)
+    Return GSM8K answer-correctness rewards for decoded model completions.
 """
 
 import random
@@ -84,6 +87,18 @@ def answers_match(prediction: str | None, ground_truth: str) -> bool:
         return abs(float(prediction) - float(ground_truth)) < 1e-5
     except ValueError:
         return prediction == ground_truth
+
+
+def answer_rewards(rollouts_text: list[str], ground_truth: str) -> list[float]:
+    """Return a binary correctness reward for each generated completion."""
+    rewards = []
+
+    for text in rollouts_text:
+        predicted_answer = extract_final_answer(text)
+        is_correct = answers_match(predicted_answer, ground_truth)
+        rewards.append(1.0 if is_correct else 0.0)
+
+    return rewards
 
 
 def _load_rows():

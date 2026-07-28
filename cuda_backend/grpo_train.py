@@ -257,7 +257,17 @@ def main():
                 rollouts,
                 rollout_masks
             )
+        # may need to move this
         policy.train()
+
+        rollouts_text = tokenizer.batch_decode(rollouts, skip_special_tokens=True) # G
+        ground_truth = sample["ground_truth"]
+        rewards = torch.tensor(
+            gsm8k.answer_rewards(rollouts_text, ground_truth),
+            dtype=torch.float32,
+            device=rollouts.device,
+        ) # [G]
+
         break
 
 

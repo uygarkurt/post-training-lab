@@ -71,17 +71,21 @@ def parse_args():
     return args
 
 
-def gsm8k_answer_reward(trajectory_tokens, masks, tokenizer, ground_truth):
-    rewards = []
-    for g in range(trajectory_tokens.shape[0]):
+def decode_rollouts(trajectory_tokens, masks, tokenizer):
+    rollouts_text = []
+
+    for group_index in range(trajectory_tokens.shape[0]):
         valid_ids = [
-            int(t) for t, m in zip(trajectory_tokens[g].tolist(), masks[g].tolist())
-            if m == 1
+            int(token)
+            for token, mask in zip(
+                trajectory_tokens[group_index].tolist(),
+                masks[group_index].tolist(),
+            )
+            if mask == 1
         ]
-        text = tokenizer.decode(valid_ids)
-        pred = gsm8k.extract_final_answer(text)
-        rewards.append(1.0 if gsm8k.answers_match(pred, ground_truth) else 0.0)
-    return mx.array(rewards, dtype=mx.float32)
+        rollouts_text.append(tokenizer.decode(valid_ids))
+
+    return rollouts_text
 
 
 def batched_rollout(model, prompt_tokens, group_size, max_new_tok, sampler, tokenizer):
@@ -158,7 +162,11 @@ def evaluate(model, val_samples, tokenizer, args):
             sampler=sampler,
             tokenizer=tokenizer,
         )
-        reward = gsm8k_answer_reward(tokens, masks, tokenizer, sample["ground_truth"])
+        rollouts_text = decode_rollouts(tokens, masks, tokenizer)
+        reward = mx.array(
+            gsm8k.answer_rewards(rollouts_text, sample["ground_truth"]),
+            dtype=mx.float32,
+        )
         total_reward += reward.item()
 
     return total_reward / len(val_samples)
@@ -347,11 +355,14 @@ def main():
             sampler,
             tokenizer)
 
-        rewards = gsm8k_answer_reward(
+        rollouts_text = decode_rollouts(
             trajectories_tokens_padded,
             trajectories_masks_padded,
             tokenizer,
-            ground_truth,
+        )
+        rewards = mx.array(
+            gsm8k.answer_rewards(rollouts_text, ground_truth),
+            dtype=mx.float32,
         )
 
         advantage = (rewards - rewards.mean()) / (rewards.std() + args.epsilon)
