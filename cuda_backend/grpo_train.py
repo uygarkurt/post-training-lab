@@ -26,7 +26,8 @@ def parse_args():
         help="Number of GSM8K samples in --debug mode (train and val use the same set)",
     )
     parser.add_argument(
-        "--model", type=str, required=True, default="Qwen/Qwen2-0.5B-Instruct",
+        "--model", type=str,
+        default="Qwen/Qwen2-0.5B-Instruct",
         help="Hugging Face base model, merged model, or local model directory",
     )
     parser.add_argument(
@@ -122,7 +123,7 @@ def load_policy_and_reference(args):
             task_type=TaskType.CAUSAL_LM,
             r=args.lora_rank,
             lora_alpha=args.lora_alpha,
-            lora_dropout=0.05,
+            lora_dropout=0.0,
             target_modules="all-linear",
         )
         print("Applying new LoRA adapters to all linear layers ...")
@@ -171,9 +172,7 @@ def load_grpo_dataset(tokenizer, args):
     )
 
 
-def generate_rollouts(policy, prompt_ids, group_size, max_new_tok, tokenizer):
-    prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device="cuda").unsqueeze(0) # [1, P]
-
+def generate_rollouts(policy, prompt_tensor, group_size, max_new_tok, tokenizer):
     # All allowing mask. Removes EOS and PAD token ambiguity.
     prompt_attention_mask = torch.ones_like(prompt_tensor)
 
@@ -187,25 +186,46 @@ def generate_rollouts(policy, prompt_ids, group_size, max_new_tok, tokenizer):
             do_sample=True,
             temperature=1.0,
             top_p=1.0,
-            use_cache=True) # [G, P + L]
+            use_cache=True,
+        )  # [G, P + L]
     policy.train()
 
-    print(generated_ids.shape)
+    prompt_length = prompt_tensor.shape[1]  # P
+    completion_ids = generated_ids[:, prompt_length:]  # [G, L]
 
-    prompt_length = prompt_tensor.shape[1] # P
-    completion_ids = generated_ids[:, prompt_length:] # [G, L]
-
-    # Works for Qwen. It produces EOS afet generation ands. Fills the rest with PAD.
+    # Works for Qwen. It produces EOS after generation ends. Fills the rest with PAD.
     is_eos_or_pad = (completion_ids.eq(tokenizer.eos_token_id) | completion_ids.eq(tokenizer.pad_token_id))
 
     # We have to include the first EOS token
-    completion_mask = (is_eos_or_pad.cumsum(dim=-1) <= 1).long() # [G, L]
+    completion_mask = (is_eos_or_pad.cumsum(dim=-1) <= 1).long()  # [G, L]
 
     return completion_ids, completion_mask
 
 
-    # def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
-    #     complete_ids = prompt_ids.repeat()
+def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
+    prompt_ids_extended = prompt_ids.repeat_interleave(rollouts.shape[0], dim=0)  # [G, P]
+    complete_ids = torch.cat([prompt_ids_extended, rollouts], dim=-1)  # [G, P + L]
+
+    logits = model(complete_ids).logits  # [G, P + L, V]
+
+    prompt_length = prompt_ids.shape[1]
+
+    # Get end of the prompt token. Since it predicts the first generated token. Don't take last token. It's out of scope.
+    logits_shift = logits[:, prompt_length - 1:-1, :]  # [G, L, V]
+
+    logprobs = torch.log_softmax(logits_shift, dim=-1)  # [G, L, V]
+
+    # Choose probabilities that corresponds to tokens in the rollout with fancy indexing.
+    group_indices = torch.arange(rollouts.shape[0], device=rollouts.device).unsqueeze(-1)
+    position_indices = torch.arange(rollouts.shape[1], device=rollouts.device).unsqueeze(0)
+    selected_logprobs = logprobs[group_indices, position_indices, rollouts]  # [G, L]
+
+    # Apply mask
+    selected_logprobs_masked = (
+        selected_logprobs * rollout_masks
+    )
+
+    return selected_logprobs_masked
 
 
 def main():
@@ -218,9 +238,28 @@ def main():
         if step >= args.num_iters:
             break
 
-        rollouts, rollout_masks = generate_rollouts(policy, sample['prompt_ids'], args.group_size, args.max_new_tok, tokenizer) # [G, L], [G, L]
+        prompt_tensor = torch.tensor(sample['prompt_ids'], dtype=torch.long, device="cuda").unsqueeze(0)  # [1, P]
 
+        rollouts, rollout_masks = generate_rollouts(policy, prompt_tensor, args.group_size, args.max_new_tok, tokenizer)  # [G, L], [G, L]
+
+        policy.eval()
+        with torch.no_grad():
+            old_logprobs = token_logprobs(
+                policy,
+                prompt_tensor,
+                rollouts,
+                rollout_masks
+            )
+
+            reference_logprobs = token_logprobs(
+                reference,
+                prompt_tensor,
+                rollouts,
+                rollout_masks
+            )
+        policy.train()
         break
+
 
 if __name__ == "__main__":
     main()
