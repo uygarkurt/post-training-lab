@@ -249,18 +249,19 @@ def main():
                 prompt_tensor,
                 rollouts,
                 rollout_masks
-            )
+            ) # [G, L]
 
             reference_logprobs = token_logprobs(
                 reference,
                 prompt_tensor,
                 rollouts,
                 rollout_masks
-            )
+            ) # [G, L]
         # may need to move this
         policy.train()
 
         rollouts_text = tokenizer.batch_decode(rollouts, skip_special_tokens=True) # G
+
         ground_truth = sample["ground_truth"]
         rewards = torch.tensor(
             gsm8k.answer_rewards(rollouts_text, ground_truth),
@@ -268,6 +269,24 @@ def main():
             device=rollouts.device,
         ) # [G]
 
+        advantage = (rewards - rewards.mean()) / (rewards.std(correction=0) + args.epsilon) # [G]
+        advantage = advantage.unsqueeze(-1) # [G, 1]
+
+        new_logprobs = token_logprobs(
+            policy,
+            prompt_tensor,
+            rollouts,
+            rollout_masks
+        ) # [G, L]
+
+        # Initially, new_logprobs +-= old_logprobs, so ratio += 1
+        ratio = torch.exp(new_logprobs - old_logprobs) # [G, L]
+
+        unclipped = ratio * advantage # [G, L]
+        clipped = torch.clamp(ratio,
+                                1 - args.clip_eps,
+                                1 + args.clip_eps) * advantage # [G, L]
+        surrogate = torch.minimum(unclipped, clipped) # [G, L]
         break
 
 
