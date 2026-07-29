@@ -88,8 +88,8 @@ def load_policy_and_reference(args):
     parameterization and can be saved as a complete model.
     """
     print(f"Loading model {args.model} ...")
-    policy = AutoModelForCausalLM.from_pretrained(args.model).to("cuda")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    policy = AutoModelForCausalLM.from_pretrained(args.model, dtype="bfloat16").to("cuda")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, dtype="bfloat16")
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -279,7 +279,7 @@ def main():
             rollout_masks
         ) # [G, L]
 
-        # Initially, new_logprobs +-= old_logprobs, so ratio += 1
+        # Initially, new_logprobs ≈ old_logprobs, so ratio ≈ 1
         ratio = torch.exp(new_logprobs - old_logprobs) # [G, L]
 
         unclipped = ratio * advantage # [G, L]
@@ -287,8 +287,18 @@ def main():
                                 1 - args.clip_eps,
                                 1 + args.clip_eps) * advantage # [G, L]
         surrogate = torch.minimum(unclipped, clipped) # [G, L]
-        break
+        
+        logprob_difference = reference_logprobs - new_logprobs # [G, L]
 
+        kl_loss = torch.exp(logprob_difference) - logprob_difference - 1 # [G, L]
+
+        grpo_loss_inside = (-surrogate + args.kl_coef * kl_loss) * rollout_masks # [G, L]
+
+        # rollout_masks.sum() contains total number of tokens (excluding PAD )
+        # clamp_min(1) just in case denominator becomes 0 with full mask sequence (edge case)
+        grpo_loss = grpo_loss_inside.sum() / rollout_masks.sum().clamp_min(1)
+        
+        break
 
 if __name__ == "__main__":
     main()
