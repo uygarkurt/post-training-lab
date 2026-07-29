@@ -304,18 +304,22 @@ def main():
     # ---- Load data ---------------------------------------------------------
     print("Loading dataset ...")
     if args.debug:
-        gsm8k_train, val_samples = gsm8k.build_debug_overfit_samples(
-            tokenizer,
-            max_prompt_len=args.max_prompt_len,
-            seed=args.seed,
-            debug_samples=args.debug_samples,
+        gsm8k_train, val_samples = (
+            gsm8k.GSM8KGRPODataset.build_debug_overfit_datasets(
+                tokenizer,
+                max_prompt_len=args.max_prompt_len,
+                seed=args.seed,
+                debug_samples=args.debug_samples,
+            )
         )
     else:
-        gsm8k_train, val_samples = gsm8k.build_grpo_samples(
-            tokenizer,
-            max_prompt_len=args.max_prompt_len,
-            val_split=args.val_split,
-            seed=args.seed,
+        gsm8k_train, val_samples = (
+            gsm8k.GSM8KGRPODataset.build_train_val_datasets(
+                tokenizer,
+                max_prompt_len=args.max_prompt_len,
+                val_split=args.val_split,
+                seed=args.seed,
+            )
         )
     data_iter = itertools.cycle(gsm8k_train)
 

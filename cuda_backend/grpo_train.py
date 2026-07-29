@@ -157,14 +157,14 @@ def load_grpo_dataset(tokenizer, args):
     """Load tokenized GSM8K prompts for GRPO training and validation."""
     print("Loading dataset ...")
     if args.debug:
-        return gsm8k.build_debug_overfit_samples(
+        return gsm8k.GSM8KGRPODataset.build_debug_overfit_datasets(
             tokenizer,
             max_prompt_len=args.max_prompt_len,
             seed=args.seed,
             debug_samples=args.debug_samples,
         )
 
-    return gsm8k.build_grpo_samples(
+    return gsm8k.GSM8KGRPODataset.build_train_val_datasets(
         tokenizer,
         max_prompt_len=args.max_prompt_len,
         val_split=args.val_split,
