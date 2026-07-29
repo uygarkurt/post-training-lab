@@ -89,7 +89,7 @@ def load_policy_and_reference(args):
     """
     print(f"Loading model {args.model} ...")
     policy = AutoModelForCausalLM.from_pretrained(args.model, dtype="bfloat16").to("cuda")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, dtype="bfloat16")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -134,7 +134,8 @@ def load_policy_and_reference(args):
         policy.requires_grad_(True)
 
     # GRPO's reference must represent the policy before its first update.
-    policy.train()
+    # Keep dropout disabled for consistent log-probability comparisons; eval mode still allows gradients.
+    policy.eval()
     reference = copy.deepcopy(policy)
     reference.requires_grad_(False)
     reference.eval()
@@ -176,7 +177,6 @@ def generate_rollouts(policy, prompt_tensor, group_size, max_new_tok, tokenizer)
     # All allowing mask. Removes EOS and PAD token ambiguity.
     prompt_attention_mask = torch.ones_like(prompt_tensor)
 
-    policy.eval()
     with torch.no_grad():
         generated_ids = policy.generate(
             input_ids=prompt_tensor,
@@ -188,7 +188,6 @@ def generate_rollouts(policy, prompt_tensor, group_size, max_new_tok, tokenizer)
             top_p=1.0,
             use_cache=True,
         )  # [G, P + L]
-    policy.train()
 
     prompt_length = prompt_tensor.shape[1]  # P
     completion_ids = generated_ids[:, prompt_length:]  # [G, L]
@@ -232,6 +231,19 @@ def main():
     args = parse_args()
     set_random_seed(args.seed)
     policy, reference, tokenizer = load_policy_and_reference(args)
+
+    # Selects only the trainable parameters (important for LoRA)
+    trainable_parameters = [
+        parameter
+        for parameter in policy.parameters()
+        if parameter.requires_grad
+    ]
+
+    optimizer = torch.optim.AdamW(
+        trainable_parameters,
+        lr=args.lr,
+    )
+
     train_samples, val_samples = load_grpo_dataset(tokenizer, args)
 
     for step, sample in enumerate(train_samples):
@@ -242,7 +254,6 @@ def main():
 
         rollouts, rollout_masks = generate_rollouts(policy, prompt_tensor, args.group_size, args.max_new_tok, tokenizer)  # [G, L], [G, L]
 
-        policy.eval()
         with torch.no_grad():
             old_logprobs = token_logprobs(
                 policy,
@@ -257,8 +268,6 @@ def main():
                 rollouts,
                 rollout_masks
             ) # [G, L]
-        # may need to move this
-        policy.train()
 
         rollouts_text = tokenizer.batch_decode(rollouts, skip_special_tokens=True) # G
 
@@ -272,33 +281,43 @@ def main():
         advantage = (rewards - rewards.mean()) / (rewards.std(correction=0) + args.epsilon) # [G]
         advantage = advantage.unsqueeze(-1) # [G, 1]
 
-        new_logprobs = token_logprobs(
-            policy,
-            prompt_tensor,
-            rollouts,
-            rollout_masks
-        ) # [G, L]
+        for _ in range(args.ppo_epochs):
+            optimizer.zero_grad()
 
-        # Initially, new_logprobs ≈ old_logprobs, so ratio ≈ 1
-        ratio = torch.exp(new_logprobs - old_logprobs) # [G, L]
+            new_logprobs = token_logprobs(
+                policy,
+                prompt_tensor,
+                rollouts,
+                rollout_masks
+            ) # [G, L]
 
-        unclipped = ratio * advantage # [G, L]
-        clipped = torch.clamp(ratio,
-                                1 - args.clip_eps,
-                                1 + args.clip_eps) * advantage # [G, L]
-        surrogate = torch.minimum(unclipped, clipped) # [G, L]
-        
-        logprob_difference = reference_logprobs - new_logprobs # [G, L]
+            # Initially, new_logprobs ≈ old_logprobs, so ratio ≈ 1
+            ratio = torch.exp(new_logprobs - old_logprobs) # [G, L]
 
-        kl_loss = torch.exp(logprob_difference) - logprob_difference - 1 # [G, L]
+            unclipped = ratio * advantage # [G, L]
+            clipped = torch.clamp(ratio,
+                                    1 - args.clip_eps,
+                                    1 + args.clip_eps) * advantage # [G, L]
+            surrogate = torch.minimum(unclipped, clipped) # [G, L]
 
-        grpo_loss_inside = (-surrogate + args.kl_coef * kl_loss) * rollout_masks # [G, L]
+            logprob_difference = reference_logprobs - new_logprobs # [G, L]
 
-        # rollout_masks.sum() contains total number of tokens (excluding PAD )
-        # clamp_min(1) just in case denominator becomes 0 with full mask sequence (edge case)
-        grpo_loss = grpo_loss_inside.sum() / rollout_masks.sum().clamp_min(1)
-        
-        break
+            kl_loss = torch.exp(logprob_difference) - logprob_difference - 1 # [G, L]
+
+            grpo_loss_inside = (-surrogate + args.kl_coef * kl_loss) * rollout_masks # [G, L]
+
+            # rollout_masks.sum() contains total number of tokens (excluding PAD )
+            # clamp_min(1) just in case denominator becomes 0 with full mask sequence (edge case)
+            grpo_loss = grpo_loss_inside.sum() / rollout_masks.sum().clamp_min(1)
+            grpo_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                trainable_parameters,
+                max_norm=1.0,
+            )
+
+            optimizer.step()
+
 
 if __name__ == "__main__":
     main()
