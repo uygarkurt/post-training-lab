@@ -19,6 +19,9 @@ GSM8KGRPODataset.build_train_val_datasets(...)
 GSM8KGRPODataset.build_debug_overfit_datasets(...)
     Return matching tiny train/validation Datasets for GRPO smoke tests.
 
+build_grpo_dataloader(...)
+    Return batches of left-padded GRPO prompts and attention masks.
+
 answer_rewards(...)
     Return GSM8K answer-correctness rewards for decoded model completions.
 """
@@ -199,7 +202,7 @@ def extract_gsm8k_answer(text):
 
 
 def extract_final_answer(text):
-    """Extract the most likely final numeric answer from model output. More flexible."""
+    """Extract the most likely final numeric answer from a model completion."""
     if not text or not text.strip():
         return None
 
@@ -219,25 +222,71 @@ def extract_final_answer(text):
 
 
 def answers_match(prediction, ground_truth):
-    """Return whether two answers match, using numeric comparison when possible."""
+    """Compare two answers numerically when possible."""
     if prediction is None:
         return False
+
     try:
         return abs(float(prediction) - float(ground_truth)) < 1e-5
     except ValueError:
         return prediction == ground_truth
 
 
+def is_answer_correct(completion_text, ground_truth):
+    """Return whether a model completion contains the expected final answer."""
+    predicted_answer = extract_final_answer(completion_text)
+    return answers_match(predicted_answer, ground_truth)
+
+
 def answer_rewards(rollouts_text, ground_truth):
-    """Return a binary correctness reward for each generated completion."""
+    """Return binary rewards for decoded model completions."""
     rewards = []
 
     for text in rollouts_text:
-        predicted_answer = extract_final_answer(text)
-        is_correct = answers_match(predicted_answer, ground_truth)
+        is_correct = is_answer_correct(text, ground_truth)
         rewards.append(1.0 if is_correct else 0.0)
 
     return rewards
+
+
+def _make_grpo_collate_fn(pad_id):
+    """Build a collator that left-pads GRPO prompts for generation."""
+    def collate_fn(batch):
+        max_prompt_length = max(len(sample["prompt_ids"]) for sample in batch)
+        prompt_ids = []
+        prompt_attention_masks = []
+
+        for sample in batch:
+            padding_length = max_prompt_length - len(sample["prompt_ids"])
+            prompt_ids.append(
+                [pad_id] * padding_length + sample["prompt_ids"]
+            )
+            prompt_attention_masks.append(
+                [0] * padding_length + [1] * len(sample["prompt_ids"])
+            )
+
+        return {
+            "prompt_ids": torch.tensor(prompt_ids, dtype=torch.long),
+            "prompt_attention_mask": torch.tensor(
+                prompt_attention_masks,
+                dtype=torch.long,
+            ),
+            "ground_truth": [sample["ground_truth"] for sample in batch],
+        }
+
+    return collate_fn
+
+
+def build_grpo_dataloader(dataset, pad_id, batch_size):
+    """Build a deterministic DataLoader of padded GRPO prompts."""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=_make_grpo_collate_fn(pad_id),
+        num_workers=0,
+        drop_last=False,
+    )
 
 
 class GSM8KGRPODataset(Dataset):

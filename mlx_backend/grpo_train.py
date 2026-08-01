@@ -19,6 +19,7 @@ from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
 from data_preparation import gsm8k
+from mlx_backend import gsm8k_eval
 
 
 def parse_args():
@@ -57,7 +58,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for data shuffle")
     parser.add_argument("--val-split", type=float, default=0.1, help="Fraction held out from GSM8K train set")
     parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
-    parser.add_argument("--eval-every", type=int, default=100, help="Evaluate on validation set every N steps (-1 to disable)")
+    parser.add_argument("--eval-every", type=int, default=100, help="Validate every N steps after the initial validation (-1 to disable)")
 
     parser.add_argument("--log-every", type=int, default=10, help="Log tokens/sec to TensorBoard every N steps")
     parser.add_argument("--param-log-every", type=int, default=50, help="Log LoRA parameter histograms every N steps")
@@ -138,38 +139,6 @@ def token_logprobs(model, prompt_tokens, input_ids, loss_mask):
     final_logprobs = gen_logprobs[g_ids, l_idx, input_ids] # [G, L]
 
     return final_logprobs * loss_mask
-
-
-def evaluate(model, val_samples, tokenizer, args):
-    """
-    Compute mean reward (answer accuracy) over the validation set (no gradients).
-
-    Uses greedy decoding (temp=0) with a single rollout per question.
-    """
-    if not val_samples:
-        return float("nan")
-
-    sampler = make_sampler(temp=0.0)
-    total_reward = 0.0
-
-    for sample in tqdm(val_samples, desc="  eval", leave=False, unit="sample"):
-        prompt_tokens = mx.array(sample["prompt_ids"])
-        tokens, _, masks = batched_rollout(
-            model,
-            prompt_tokens,
-            group_size=1,
-            max_new_tok=args.max_new_tok,
-            sampler=sampler,
-            tokenizer=tokenizer,
-        )
-        rollouts_text = decode_rollouts(tokens, masks, tokenizer)
-        reward = mx.array(
-            gsm8k.answer_rewards(rollouts_text, sample["ground_truth"]),
-            dtype=mx.float32,
-        )
-        total_reward += reward.item()
-
-    return total_reward / len(val_samples)
 
 
 def read_adapter_config(adapter_dir):
@@ -330,6 +299,16 @@ def main():
     writer = SummaryWriter(log_dir=args.tensorboard_dir)
     print(f"TensorBoard logs -> {args.tensorboard_dir}  (run: tensorboard --logdir={args.tensorboard_dir})")
 
+    if args.eval_every != -1:
+        val_accuracy = gsm8k_eval.validate(
+            policy,
+            val_samples,
+            tokenizer,
+            args.max_new_tok,
+        )
+        writer.add_scalar("val/accuracy", val_accuracy, 0)
+        print(f"  [val] step {0:5d} | accuracy {val_accuracy:.4f}")
+
     # ---- Training loop -----------------------------------------------------
     mode = "debug" if args.debug else "gsm8k"
     print(f"\nTraining: {args.num_iters} steps | group={args.group_size} | lr={args.lr} | "
@@ -435,10 +414,19 @@ def main():
                 writer.add_histogram(f"params/{name}", np.array(param), step)
 
         # ---- Validation ----------------------------------------------------
-        if args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
-            val_reward = evaluate(policy, val_samples, tokenizer, args)
-            writer.add_scalar("val/reward", val_reward, step)
-            pbar.write(f"  [eval] step {step:5d} | val_reward {val_reward:.4f}")
+        completed_step = step + 1
+        if args.eval_every > 0 and completed_step % args.eval_every == 0:
+            val_accuracy = gsm8k_eval.validate(
+                policy,
+                val_samples,
+                tokenizer,
+                args.max_new_tok,
+            )
+            writer.add_scalar("val/accuracy", val_accuracy, completed_step)
+            pbar.write(
+                f"  [val] step {completed_step:5d} | "
+                f"accuracy {val_accuracy:.4f}"
+            )
 
         # ---- Checkpoint ----------------------------------------------------
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:

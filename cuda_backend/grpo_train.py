@@ -8,6 +8,7 @@ import torch
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from cuda_backend import gsm8k_eval
 from data_preparation import gsm8k
 
 
@@ -54,7 +55,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization, data shuffle, and rollout sampling")
     parser.add_argument("--val-split", type=float, default=0.1, help="Fraction held out from GSM8K train set")
     parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
-    parser.add_argument("--eval-every", type=int, default=100, help="Evaluate on validation set every N steps (-1 to disable)")
+    parser.add_argument("--eval-every", type=int, default=100, help="Validate every N steps after the initial validation (-1 to disable)")
+    parser.add_argument("--eval-batch-size", type=int, default=8, help="Prompts generated together during validation")
 
     parser.add_argument("--log-every", type=int, default=10, help="Log tokens/sec to TensorBoard every N steps")
     parser.add_argument("--param-log-every", type=int, default=50, help="Log LoRA parameter histograms every N steps")
@@ -155,8 +157,7 @@ def load_policy_and_reference(args):
 
 
 def load_grpo_dataset(tokenizer, args):
-    """Load tokenized GSM8K prompts for GRPO training and validation."""
-    print("Loading dataset ...")
+    print("Loading GSM8K dataset ...")
     if args.debug:
         return gsm8k.GSM8KGRPODataset.build_debug_overfit_datasets(
             tokenizer,
@@ -244,7 +245,17 @@ def main():
         lr=args.lr,
     )
 
-    train_samples, val_samples = load_grpo_dataset(tokenizer, args)
+    train_samples, val_dataset = load_grpo_dataset(tokenizer, args)
+
+    if args.eval_every != -1:
+        val_accuracy = gsm8k_eval.validate(
+            policy,
+            val_dataset,
+            tokenizer,
+            args.max_new_tok,
+            args.eval_batch_size,
+        )
+        print(f"  [val] step {0:5d} | accuracy {val_accuracy:.4f}")
 
     for step, sample in enumerate(train_samples):
         if step >= args.num_iters:
@@ -317,6 +328,17 @@ def main():
             )
 
             optimizer.step()
+
+        completed_step = step + 1
+        if args.eval_every > 0 and completed_step % args.eval_every == 0:
+            val_accuracy = gsm8k_eval.validate(
+                policy,
+                val_dataset,
+                tokenizer,
+                args.max_new_tok,
+                args.eval_batch_size,
+            )
+            print(f"  [val] step {completed_step:5d} | accuracy {val_accuracy:.4f}")
 
 
 if __name__ == "__main__":

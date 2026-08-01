@@ -31,6 +31,8 @@ multiple abstraction layers.
   visible in its training script.
 - Use descriptive variable names, especially for losses, rewards, advantages,
   masks, token probabilities, and other algorithm-specific quantities.
+- Do not add Python type annotations to function or method signatures.
+- Give every new function and class a concise docstring describing its purpose.
 - Keep new dependencies to a minimum.
 - Make the smallest change that satisfies the request.
 - Preserve hackability: changing an algorithm, loss, reward, dataset, or model
