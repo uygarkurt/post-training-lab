@@ -12,8 +12,8 @@ import numpy as np
 import torch
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cuda_backend import gsm8k_eval
 from data_preparation import gsm8k
