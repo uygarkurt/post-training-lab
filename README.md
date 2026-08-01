@@ -47,6 +47,9 @@ post-training-lab/
 └── runs/                    # Backend-qualified TensorBoard logs (gitignored)
 ```
 
+CUDA GRPO runs use `runs/cuda/grpo_<timestamp>/` with matching checkpoints in
+`checkpoints/cuda/grpo_<timestamp>/`.
+
 ## Citation
 
 If you use this software, please cite it:

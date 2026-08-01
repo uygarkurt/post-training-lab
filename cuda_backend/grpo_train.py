@@ -1,12 +1,19 @@
 import argparse
 import copy
+import json
 import os
 import random
+import subprocess
+import sys
+import time
+from datetime import datetime
 
 import numpy as np
 import torch
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
+from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
 
 from cuda_backend import gsm8k_eval
 from data_preparation import gsm8k
@@ -58,15 +65,14 @@ def parse_args():
     parser.add_argument("--eval-every", type=int, default=100, help="Validate every N steps after the initial validation (-1 to disable)")
     parser.add_argument("--eval-batch-size", type=int, default=8, help="Prompts generated together during validation")
 
-    parser.add_argument("--log-every", type=int, default=10, help="Log tokens/sec to TensorBoard every N steps")
-    parser.add_argument("--param-log-every", type=int, default=50, help="Log LoRA parameter histograms every N steps")
+    parser.add_argument("--tensorboard-dir", type=str, default="./runs/cuda/grpo", help="Base path for timestamped TensorBoard run directories")
 
-    parser.add_argument("--tensorboard-dir", type=str, default="./runs/cuda/grpo", help="Directory for TensorBoard logs")
-
-    parser.add_argument("--save-every", type=int, default=100, help="Save adapter checkpoint every N steps (0 to disable)")
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/cuda/grpo", help="Directory for checkpoints")
+    parser.add_argument("--save-every", type=int, default=100, help="Save a model checkpoint every N steps (0 to disable)")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/cuda/grpo", help="Base path for timestamped checkpoint directories")
 
     args = parser.parse_args()
+    if args.ppo_epochs < 1:
+        parser.error("--ppo-epochs must be at least 1")
     return args
 
 
@@ -230,6 +236,29 @@ def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
 
 def main():
     args = parse_args()
+    saved_args = vars(args).copy()
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    args.tensorboard_dir = f"{os.path.normpath(args.tensorboard_dir)}_{timestamp}"
+    args.checkpoint_dir = f"{os.path.normpath(args.checkpoint_dir)}_{timestamp}"
+    os.makedirs(args.tensorboard_dir)
+    os.makedirs(args.checkpoint_dir)
+
+    with open(os.path.join(args.tensorboard_dir, "args.json"), "w") as args_file:
+        json.dump(saved_args, args_file, indent=2)
+
+    terminal_columns = os.get_terminal_size(2).columns if os.isatty(2) else None
+    terminal_stdout = os.dup(1)
+    terminal_stderr = os.dup(2)
+    tee_process = subprocess.Popen(
+        ["tee", os.path.join(args.tensorboard_dir, "out.log")],
+        stdin=subprocess.PIPE,
+    )
+    os.dup2(tee_process.stdin.fileno(), 1)
+    os.dup2(tee_process.stdin.fileno(), 2)
+
+    print(f"Run directory: {args.tensorboard_dir}")
+    print(f"Checkpoint directory: {args.checkpoint_dir}")
+
     set_random_seed(args.seed)
     policy, reference, tokenizer = load_policy_and_reference(args)
 
@@ -246,6 +275,8 @@ def main():
     )
 
     train_samples, val_dataset = load_grpo_dataset(tokenizer, args)
+    writer = SummaryWriter(log_dir=args.tensorboard_dir)
+    print(f"TensorBoard logs: tensorboard --logdir={args.tensorboard_dir}")
 
     if args.eval_every != -1:
         val_accuracy = gsm8k_eval.validate(
@@ -255,11 +286,22 @@ def main():
             args.max_new_tok,
             args.eval_batch_size,
         )
+        writer.add_scalar("val/accuracy", val_accuracy, 0)
         print(f"  [val] step {0:5d} | accuracy {val_accuracy:.4f}")
+
+    total_steps = min(args.num_iters, len(train_samples))
+    progress = tqdm(
+        total=total_steps,
+        desc="train loss=----",
+        unit="step",
+        ncols=terminal_columns,
+    )
+    completed_steps = 0
 
     for step, sample in enumerate(train_samples):
         if step >= args.num_iters:
             break
+        step_start_time = time.time()
 
         prompt_tensor = torch.tensor(sample['prompt_ids'], dtype=torch.long, device="cuda").unsqueeze(0)  # [1, P]
 
@@ -292,6 +334,9 @@ def main():
         advantage = (rewards - rewards.mean()) / (rewards.std(correction=0) + args.epsilon) # [G]
         advantage = advantage.unsqueeze(-1) # [G, 1]
 
+        ppo_epoch_losses = []
+        ppo_epoch_kl_values = []
+        ppo_epoch_gradient_norms = []
         for _ in range(args.ppo_epochs):
             optimizer.zero_grad()
 
@@ -320,16 +365,60 @@ def main():
             # rollout_masks.sum() contains total number of tokens (excluding PAD )
             # clamp_min(1) just in case denominator becomes 0 with full mask sequence (edge case)
             grpo_loss = grpo_loss_inside.sum() / rollout_masks.sum().clamp_min(1)
+            mean_kl = (kl_loss * rollout_masks).sum() / rollout_masks.sum().clamp_min(1)
             grpo_loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
                 trainable_parameters,
                 max_norm=1.0,
             )
 
             optimizer.step()
 
+            ppo_epoch_losses.append(grpo_loss.detach())
+            ppo_epoch_kl_values.append(mean_kl.detach())
+            ppo_epoch_gradient_norms.append(gradient_norm.detach())
+
         completed_step = step + 1
+        completed_steps = completed_step
+        mean_loss = torch.stack(ppo_epoch_losses).mean().float().item()
+        mean_kl = torch.stack(ppo_epoch_kl_values).mean().float().item()
+        mean_gradient_norm = torch.stack(
+            ppo_epoch_gradient_norms
+        ).mean().float().item()
+        mean_reward = rewards.mean().item()
+        reward_std = rewards.std(correction=0).item()
+        completion_tokens = rollout_masks.sum().item()
+        tokens_per_second = completion_tokens / max(
+            time.time() - step_start_time,
+            1e-8,
+        )
+
+        writer.add_scalar("train/loss", mean_loss, completed_step)
+        writer.add_scalar("train/reward", mean_reward, completed_step)
+        writer.add_scalar("train/reward_std", reward_std, completed_step)
+        writer.add_scalar(
+            "train/informative_group",
+            float(reward_std > 0.0),
+            completed_step,
+        )
+        writer.add_scalar("train/kl", mean_kl, completed_step)
+        writer.add_scalar("train/grad_norm", mean_gradient_norm, completed_step)
+        writer.add_scalar("train/learning_rate", args.lr, completed_step)
+        writer.add_scalar(
+            "train/completion_tokens",
+            completion_tokens,
+            completed_step,
+        )
+        writer.add_scalar(
+            "train/tokens_per_sec",
+            tokens_per_second,
+            completed_step,
+        )
+
+        progress.set_description(f"train loss={mean_loss:.4f}")
+        progress.update(1)
+
         if args.eval_every > 0 and completed_step % args.eval_every == 0:
             val_accuracy = gsm8k_eval.validate(
                 policy,
@@ -338,7 +427,47 @@ def main():
                 args.max_new_tok,
                 args.eval_batch_size,
             )
-            print(f"  [val] step {completed_step:5d} | accuracy {val_accuracy:.4f}")
+            writer.add_scalar("val/accuracy", val_accuracy, completed_step)
+            progress.write(
+                f"  [val] step {completed_step:5d} | "
+                f"accuracy {val_accuracy:.4f}"
+            )
+
+        if args.save_every > 0 and completed_step % args.save_every == 0:
+            writer.flush()
+            checkpoint_path = os.path.join(
+                args.checkpoint_dir,
+                f"step_{completed_step:06d}",
+            )
+            policy.save_pretrained(checkpoint_path)
+            tokenizer.save_pretrained(checkpoint_path)
+            print(f"  [ckpt] step {completed_step:5d} -> {checkpoint_path}")
+
+    progress.close()
+
+    if (
+        args.save_every > 0
+        and completed_steps > 0
+        and completed_steps % args.save_every != 0
+    ):
+        writer.flush()
+        checkpoint_path = os.path.join(
+            args.checkpoint_dir,
+            f"step_{completed_steps:06d}",
+        )
+        policy.save_pretrained(checkpoint_path)
+        tokenizer.save_pretrained(checkpoint_path)
+        print(f"  [ckpt] step {completed_steps:5d} -> {checkpoint_path}")
+
+    writer.close()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.dup2(terminal_stdout, 1)
+    os.dup2(terminal_stderr, 2)
+    os.close(terminal_stdout)
+    os.close(terminal_stderr)
+    tee_process.stdin.close()
+    tee_process.wait()
 
 
 if __name__ == "__main__":
