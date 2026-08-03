@@ -6,7 +6,7 @@ import random
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 import numpy as np
 import torch
@@ -238,7 +238,7 @@ def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
 def main():
     args = parse_args()
     saved_args = vars(args).copy()
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
     args.tensorboard_dir = f"{os.path.normpath(args.tensorboard_dir)}_{timestamp}"
     args.checkpoint_dir = f"{os.path.normpath(args.checkpoint_dir)}_{timestamp}"
     os.makedirs(args.tensorboard_dir)
