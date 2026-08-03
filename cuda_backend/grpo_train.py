@@ -47,22 +47,22 @@ def parse_args():
         help="Train LoRA parameters only, or all parameters of a dense model",
     )
 
-    parser.add_argument("--group-size", type=int, default=8, help="Number of rollouts per prompt (G)")
-    parser.add_argument("--max-new-tok", type=int, default=512, help="Max tokens to generate per rollout")
+    parser.add_argument("--group-size", type=int, default=4, help="Number of rollouts per prompt (G)")
+    parser.add_argument("--max-new-tok", type=int, default=256, help="Max tokens to generate per rollout")
     parser.add_argument("--lr", type=float, default=1e-6, help="AdamW learning rate")
     parser.add_argument("--kl-coef", type=float, default=0.02, help="KL penalty coefficient")
     parser.add_argument("--clip-eps", type=float, default=0.2, help="PPO clip epsilon")
     parser.add_argument("--ppo-epochs", type=int, default=4, help="PPO inner epochs per step")
-    parser.add_argument("--num-iters", type=int, default=500, help="Total gradient steps")
+    parser.add_argument("--num-iters", type=int, default=500, help="Number of outer training iterations")
     parser.add_argument("--epsilon", type=float, default=1e-8, help="Advantage normalisation epsilon")
 
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank (r)")
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha (scale = alpha / rank)")
 
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization, data shuffle, and rollout sampling")
-    parser.add_argument("--val-split", type=float, default=0.1, help="Fraction held out from GSM8K train set")
+    parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from GSM8K train set")
     parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
-    parser.add_argument("--eval-every", type=int, default=100, help="Validate every N steps after the initial validation (-1 to disable)")
+    parser.add_argument("--eval-every", type=int, default=50, help="Validate every N steps after the initial validation (-1 to disable)")
     parser.add_argument("--eval-batch-size", type=int, default=8, help="Prompts generated together during validation")
 
     parser.add_argument("--tensorboard-dir", type=str, default="./runs/cuda/grpo", help="Base path for timestamped TensorBoard run directories")
@@ -204,15 +204,16 @@ def generate_rollouts(policy, prompt_tensor, group_size, max_new_tok, tokenizer)
 
     # We have to include the first EOS token
     completion_mask = (is_eos_or_pad.cumsum(dim=-1) <= 1).long()  # [G, L]
+    truncated_rollouts = ~is_eos_or_pad.any(dim=-1)  # [G]
 
-    return completion_ids, completion_mask
+    return completion_ids, completion_mask, truncated_rollouts
 
 
 def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
     prompt_ids_extended = prompt_ids.repeat_interleave(rollouts.shape[0], dim=0)  # [G, P]
     complete_ids = torch.cat([prompt_ids_extended, rollouts], dim=-1)  # [G, P + L]
 
-    logits = model(complete_ids).logits  # [G, P + L, V]
+    logits = model(complete_ids, use_cache=False).logits  # [G, P + L, V]
 
     prompt_length = prompt_ids.shape[1]
 
@@ -305,7 +306,13 @@ def main():
 
         prompt_tensor = torch.tensor(sample['prompt_ids'], dtype=torch.long, device="cuda").unsqueeze(0)  # [1, P]
 
-        rollouts, rollout_masks = generate_rollouts(policy, prompt_tensor, args.group_size, args.max_new_tok, tokenizer)  # [G, L], [G, L]
+        rollouts, rollout_masks, truncated_rollouts = generate_rollouts(
+            policy,
+            prompt_tensor,
+            args.group_size,
+            args.max_new_tok,
+            tokenizer,
+        )  # [G, L], [G, L], [G]
 
         with torch.no_grad():
             old_logprobs = token_logprobs(
@@ -388,6 +395,7 @@ def main():
         ).mean().float().item()
         mean_reward = rewards.mean().item()
         reward_std = rewards.std(correction=0).item()
+        truncated_rollout_fraction = truncated_rollouts.float().mean().item()
         completion_tokens = rollout_masks.sum().item()
         tokens_per_second = completion_tokens / max(
             time.time() - step_start_time,
@@ -397,6 +405,11 @@ def main():
         writer.add_scalar("train/loss", mean_loss, completed_step)
         writer.add_scalar("train/reward", mean_reward, completed_step)
         writer.add_scalar("train/reward_std", reward_std, completed_step)
+        writer.add_scalar(
+            "train/truncated_rollout_fraction",
+            truncated_rollout_fraction,
+            completed_step,
+        )
         writer.add_scalar(
             "train/informative_group",
             float(reward_std > 0.0),
