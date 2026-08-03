@@ -1,24 +1,26 @@
 # Post-Training Lab
 
-A minimal, hackable implementation of LLM post-training. Each training stage is
-a self-contained script you can read top to bottom, understand completely, and
-bend to your own dataset or reward.
+A minimal, hackable implementation of the full LLM post-training pipeline:
+supervised fine-tuning (SFT), reinforcement learning with GRPO, evaluation, and
+inference. Each stage is a self-contained script you can read top to bottom,
+understand completely, and bend to your own dataset or reward.
 
 The priority is clarity over abstraction: no framework to learn, no backend
 layer hiding the algorithm, and no need to trace a dozen files to understand a
-loss or training step.
+loss or training step. Implementations use native MLX on Apple Silicon and
+PyTorch with CUDA on NVIDIA GPUs.
 
 ## Choose a backend
 
 | Backend | Hardware | Status | Documentation |
 | ------- | -------- | ------ | ------------- |
 | MLX | Apple Silicon | Supported | [MLX backend](mlx_backend/README.md) |
-| CUDA | NVIDIA GPU | In progress | [CUDA backend](cuda_backend/README.md) |
+| PyTorch (CUDA) | NVIDIA GPU | In progress | [PyTorch (CUDA) backend](cuda_backend/README.md) |
 
 ## Supported algorithms
 
-| Algorithm | MLX (Apple Silicon) | CUDA (NVIDIA GPU) |
-| --------- | ------------------- | ----------------- |
+| Algorithm | MLX (Apple Silicon) | PyTorch (CUDA) |
+| --------- | ------------------- | -------------- |
 | SFT | ✅ | ❌ |
 | GRPO | ✅ | ✅ |
 
@@ -40,7 +42,7 @@ post-training-lab/
 │   ├── grpo_train.py
 │   ├── generate_text.py
 │   └── gsm8k_eval.py
-├── cuda_backend/            # Runnable NVIDIA GPU implementation
+├── cuda_backend/            # Runnable PyTorch implementation
 │   ├── grpo_train.py
 │   ├── generate_text.py
 │   └── gsm8k_eval.py
@@ -50,10 +52,10 @@ post-training-lab/
 └── runs/                    # Backend-qualified TensorBoard logs (gitignored)
 ```
 
-CUDA GRPO runs use `runs/cuda/grpo_<timestamp>/` with matching checkpoints in
-`checkpoints/cuda/grpo_<timestamp>/`.
+PyTorch/CUDA GRPO runs use `runs/cuda/grpo_<timestamp>/` with matching
+checkpoints in `checkpoints/cuda/grpo_<timestamp>/`.
 
-Generate text or evaluate a CUDA checkpoint on the GSM8K test split:
+Generate text or evaluate a PyTorch/CUDA checkpoint on the GSM8K test split:
 
 ```bash
 uv run --extra cuda -m cuda_backend.generate_text --model_path <checkpoint>
