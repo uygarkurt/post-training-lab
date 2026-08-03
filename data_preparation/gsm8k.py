@@ -46,8 +46,8 @@ _ANSWER_IS_RE = re.compile(
 _NUMBER_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
 
 
-def _load_rows():
-    return hf_load_dataset(DATASET_NAME, DATASET_SUBSET, split=DATASET_SPLIT)
+def _load_rows(split=DATASET_SPLIT):
+    return hf_load_dataset(DATASET_NAME, DATASET_SUBSET, split=split)
 
 
 # SFT preparation
@@ -292,11 +292,11 @@ def build_grpo_dataloader(dataset, pad_id, batch_size):
 class GSM8KGRPODataset(Dataset):
     """Tokenize and hold GSM8K prompts and answers for GRPO."""
 
-    def __init__(self, tokenizer, max_prompt_len):
+    def __init__(self, tokenizer, max_prompt_len, split=DATASET_SPLIT):
         self.samples = []
         self.skipped = 0
 
-        for row in _load_rows():
+        for row in _load_rows(split):
             question = row["question"]
             answer = row["answer"]
 
