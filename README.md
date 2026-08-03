@@ -20,7 +20,7 @@ loss or training step.
 | Algorithm | MLX (Apple Silicon) | CUDA (NVIDIA GPU) |
 | --------- | ------------------- | ----------------- |
 | SFT | ✅ | ❌ |
-| GRPO | ✅ | ❌ |
+| GRPO | ✅ | ✅ |
 
 ## Shared requirements
 
@@ -28,9 +28,8 @@ loss or training step.
 - [uv](https://github.com/astral-sh/uv)
 
 This repository uses one project environment. Install and run only the optional
-backend dependencies you need. The currently runnable MLX commands use
-`--extra mlx`; CUDA dependencies will be declared when that implementation is
-available.
+backend dependencies you need. Use `--extra mlx` for MLX commands and
+`--extra cuda` for CUDA commands.
 
 ## Project layout
 
@@ -39,8 +38,12 @@ post-training-lab/
 ├── mlx_backend/             # Runnable Apple Silicon implementation
 │   ├── sft_train.py
 │   ├── grpo_train.py
-│   └── generate_text.py
-├── cuda_backend/            # CUDA status and future implementation
+│   ├── generate_text.py
+│   └── gsm8k_eval.py
+├── cuda_backend/            # Runnable NVIDIA GPU implementation
+│   ├── grpo_train.py
+│   ├── generate_text.py
+│   └── gsm8k_eval.py
 ├── data_preparation/
 │   └── gsm8k.py             # Shared samples, DataLoaders, and answer matching
 ├── checkpoints/             # Backend-qualified checkpoints (gitignored)
@@ -49,6 +52,16 @@ post-training-lab/
 
 CUDA GRPO runs use `runs/cuda/grpo_<timestamp>/` with matching checkpoints in
 `checkpoints/cuda/grpo_<timestamp>/`.
+
+Generate text or evaluate a CUDA checkpoint on the GSM8K test split:
+
+```bash
+uv run --extra cuda -m cuda_backend.generate_text --model_path <checkpoint>
+uv run --extra cuda -m cuda_backend.gsm8k_eval --model_path <checkpoint>
+```
+
+Add `--load-adapter` when `<checkpoint>` is a PEFT adapter checkpoint. See the
+[CUDA backend documentation](cuda_backend/README.md) for complete examples.
 
 ## Citation
 
