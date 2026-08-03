@@ -6,10 +6,10 @@ Fine-tunes Qwen/Qwen2-0.5B-Instruct-MLX on openai/gsm8k (socratic/train)
 for chain-of-thought reasoning using LoRA.
 
 Usage:
-    python sft_train_mlx.py
+    uv run --extra mlx -m mlx_backend.sft_train
 
 Dependencies:
-    pip install mlx mlx-lm datasets transformers tensorboard
+    uv sync --extra mlx
 """
 
 import argparse
@@ -31,8 +31,7 @@ from mlx_lm.tuner.utils import linear_to_lora_layers
 
 from tensorboardX import SummaryWriter
 
-import data_preparation.gsm8k as _gsm8k_data
-
+from data_preparation import gsm8k
 
 
 # ---------------------------------------------------------------------------
@@ -67,11 +66,12 @@ def parse_args():
     # Logging / checkpointing
     parser.add_argument("--log-every",       type=int,   default=10,    help="Print loss + TensorBoard scalars every N steps")
     parser.add_argument("--save-every",      type=int,   default=100,   help="Save adapter checkpoint every N steps")
-    parser.add_argument("--checkpoint-dir",  type=str,   default="./checkpoints/sft", help="Directory for checkpoints")
-    parser.add_argument("--tensorboard-dir", type=str,   default="./runs/sft",    help="Directory for TensorBoard logs")
+    parser.add_argument("--checkpoint-dir",  type=str,   default="./checkpoints/mlx/sft", help="Directory for checkpoints")
+    parser.add_argument("--tensorboard-dir", type=str,   default="./runs/mlx/sft",    help="Directory for TensorBoard logs")
     parser.add_argument("--param-log-every", type=int,   default=50,    help="Log LoRA parameter histograms every N steps")
 
     return parser.parse_args()
+
 
 # ---------------------------------------------------------------------------
 # Batch conversion
@@ -236,10 +236,15 @@ def main():
     # ---- Load and tokenise data --------------------------------------------
     print("Loading dataset ...")
     if args.dataset == "gsm8k":
-        build_dataloaders = _gsm8k_data.build_dataloaders
+        train_loader, val_loader = gsm8k.build_sft_dataloaders(
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            val_split=args.val_split,
+            seed=args.seed,
+            batch_size=args.batch_size,
+        )
     else:
         raise ValueError(f"Unknown dataset '{args.dataset}'. Choose from: gsm8k")
-    train_loader, val_loader = build_dataloaders(tokenizer, args)
 
     # ---- Optimizer ---------------------------------------------------------
     # Initialise with peak LR; we override it each step during warmup.

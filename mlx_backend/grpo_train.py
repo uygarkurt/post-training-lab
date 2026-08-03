@@ -18,7 +18,8 @@ from mlx.utils import tree_flatten
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
-import data_preparation.gsm8k_grpo as gsm8k_grpo
+from data_preparation import gsm8k
+from mlx_backend import gsm8k_eval
 
 
 def parse_args():
@@ -57,31 +58,35 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for data shuffle")
     parser.add_argument("--val-split", type=float, default=0.1, help="Fraction held out from GSM8K train set")
     parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
-    parser.add_argument("--eval-every", type=int, default=100, help="Evaluate on validation set every N steps (-1 to disable)")
+    parser.add_argument("--eval-every", type=int, default=100, help="Validate every N steps after the initial validation (-1 to disable)")
 
     parser.add_argument("--log-every", type=int, default=10, help="Log tokens/sec to TensorBoard every N steps")
     parser.add_argument("--param-log-every", type=int, default=50, help="Log LoRA parameter histograms every N steps")
 
-    parser.add_argument("--tensorboard-dir", type=str, default="./runs/grpo", help="Directory for TensorBoard logs")
+    parser.add_argument("--tensorboard-dir", type=str, default="./runs/mlx/grpo", help="Directory for TensorBoard logs")
 
     parser.add_argument("--save-every", type=int, default=100, help="Save adapter checkpoint every N steps (0 to disable)")
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/grpo", help="Directory for checkpoints")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/mlx/grpo", help="Directory for checkpoints")
 
     args = parser.parse_args()
     return args
 
 
-def gsm8k_answer_reward(trajectory_tokens, masks, tokenizer, ground_truth):
-    rewards = []
-    for g in range(trajectory_tokens.shape[0]):
+def decode_rollouts(trajectory_tokens, masks, tokenizer):
+    rollouts_text = []
+
+    for group_index in range(trajectory_tokens.shape[0]):
         valid_ids = [
-            int(t) for t, m in zip(trajectory_tokens[g].tolist(), masks[g].tolist())
-            if m == 1
+            int(token)
+            for token, mask in zip(
+                trajectory_tokens[group_index].tolist(),
+                masks[group_index].tolist(),
+            )
+            if mask == 1
         ]
-        text = tokenizer.decode(valid_ids)
-        pred = gsm8k_grpo.extract_final_answer(text)
-        rewards.append(1.0 if gsm8k_grpo.answers_match(pred, ground_truth) else 0.0)
-    return mx.array(rewards, dtype=mx.float32)
+        rollouts_text.append(tokenizer.decode(valid_ids))
+
+    return rollouts_text
 
 
 def batched_rollout(model, prompt_tokens, group_size, max_new_tok, sampler, tokenizer):
@@ -134,34 +139,6 @@ def token_logprobs(model, prompt_tokens, input_ids, loss_mask):
     final_logprobs = gen_logprobs[g_ids, l_idx, input_ids] # [G, L]
 
     return final_logprobs * loss_mask
-
-
-def evaluate(model, val_samples, tokenizer, args):
-    """
-    Compute mean reward (answer accuracy) over the validation set (no gradients).
-
-    Uses greedy decoding (temp=0) with a single rollout per question.
-    """
-    if not val_samples:
-        return float("nan")
-
-    sampler = make_sampler(temp=0.0)
-    total_reward = 0.0
-
-    for sample in tqdm(val_samples, desc="  eval", leave=False, unit="sample"):
-        prompt_tokens = mx.array(sample["prompt_ids"])
-        tokens, _, masks = batched_rollout(
-            model,
-            prompt_tokens,
-            group_size=1,
-            max_new_tok=args.max_new_tok,
-            sampler=sampler,
-            tokenizer=tokenizer,
-        )
-        reward = gsm8k_answer_reward(tokens, masks, tokenizer, sample["ground_truth"])
-        total_reward += reward.item()
-
-    return total_reward / len(val_samples)
 
 
 def read_adapter_config(adapter_dir):
@@ -296,9 +273,23 @@ def main():
     # ---- Load data ---------------------------------------------------------
     print("Loading dataset ...")
     if args.debug:
-        gsm8k_train, val_samples = gsm8k_grpo.build_debug_overfit_samples(tokenizer, args)
+        gsm8k_train, val_samples = (
+            gsm8k.GSM8KGRPODataset.build_debug_overfit_datasets(
+                tokenizer,
+                max_prompt_len=args.max_prompt_len,
+                seed=args.seed,
+                debug_samples=args.debug_samples,
+            )
+        )
     else:
-        gsm8k_train, val_samples = gsm8k_grpo.build_grpo_samples(tokenizer, args)
+        gsm8k_train, val_samples = (
+            gsm8k.GSM8KGRPODataset.build_train_val_datasets(
+                tokenizer,
+                max_prompt_len=args.max_prompt_len,
+                val_split=args.val_split,
+                seed=args.seed,
+            )
+        )
     data_iter = itertools.cycle(gsm8k_train)
 
     # ---- Optimizer ---------------------------------------------------------
@@ -307,6 +298,16 @@ def main():
     # ---- TensorBoard -------------------------------------------------------
     writer = SummaryWriter(log_dir=args.tensorboard_dir)
     print(f"TensorBoard logs -> {args.tensorboard_dir}  (run: tensorboard --logdir={args.tensorboard_dir})")
+
+    if args.eval_every != -1:
+        val_accuracy = gsm8k_eval.validate(
+            policy,
+            val_samples,
+            tokenizer,
+            args.max_new_tok,
+        )
+        writer.add_scalar("val/accuracy", val_accuracy, 0)
+        print(f"  [val] step {0:5d} | accuracy {val_accuracy:.4f}")
 
     # ---- Training loop -----------------------------------------------------
     mode = "debug" if args.debug else "gsm8k"
@@ -337,11 +338,14 @@ def main():
             sampler,
             tokenizer)
 
-        rewards = gsm8k_answer_reward(
+        rollouts_text = decode_rollouts(
             trajectories_tokens_padded,
             trajectories_masks_padded,
             tokenizer,
-            ground_truth,
+        )
+        rewards = mx.array(
+            gsm8k.answer_rewards(rollouts_text, ground_truth),
+            dtype=mx.float32,
         )
 
         advantage = (rewards - rewards.mean()) / (rewards.std() + args.epsilon)
@@ -410,10 +414,19 @@ def main():
                 writer.add_histogram(f"params/{name}", np.array(param), step)
 
         # ---- Validation ----------------------------------------------------
-        if args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
-            val_reward = evaluate(policy, val_samples, tokenizer, args)
-            writer.add_scalar("val/reward", val_reward, step)
-            pbar.write(f"  [eval] step {step:5d} | val_reward {val_reward:.4f}")
+        completed_step = step + 1
+        if args.eval_every > 0 and completed_step % args.eval_every == 0:
+            val_accuracy = gsm8k_eval.validate(
+                policy,
+                val_samples,
+                tokenizer,
+                args.max_new_tok,
+            )
+            writer.add_scalar("val/accuracy", val_accuracy, completed_step)
+            pbar.write(
+                f"  [val] step {completed_step:5d} | "
+                f"accuracy {val_accuracy:.4f}"
+            )
 
         # ---- Checkpoint ----------------------------------------------------
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
@@ -441,7 +454,7 @@ def main():
             max_tokens=args.max_new_tok,
             sampler=make_sampler(temp=1.0, top_p=1.0),
         )
-        pred = gsm8k_grpo.extract_final_answer(text)
+        pred = gsm8k.extract_final_answer(text)
         print(f"model output:\n{text}")
         print(f"extracted answer: {pred}")
 

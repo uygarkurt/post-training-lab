@@ -1,6 +1,6 @@
 [project]
 name = "post-training-lab"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small, readable, runnable post-training codebase (SFT + GRPO with LoRA) you can learn from and customize."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -9,13 +9,21 @@ authors = [{ name = "Uygar Kurt" }]
 keywords = ["post-training", "sft", "grpo", "rlhf", "lora", "mlx"]
 dependencies = [
     "datasets>=4.8.4",
-    "mlx>=0.31.1",
-    "mlx-lm>=0.31.2",
     "numpy>=2.0",
     "tensorboard>=2.20.0",
     "tensorboardx>=2.6.5",
     "torch>=2.11.0",
     "tqdm>=4.67.3",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.31.1",
+    "mlx-lm>=0.31.2",
+]
+cuda = [
+    "peft>=0.19.1",
+    "transformers>=5.5.3",
 ]
 
 [project.urls]
