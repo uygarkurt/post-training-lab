@@ -91,6 +91,9 @@ def main():
         generated_ids = model.generate(
             **model_inputs,
             max_new_tokens=args.max_new_tokens,
+            num_return_sequences=1,
+            do_sample=False,
+            use_cache=True,
             pad_token_id=tokenizer.pad_token_id,
         )
 
