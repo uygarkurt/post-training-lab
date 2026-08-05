@@ -24,6 +24,12 @@ PyTorch with CUDA on NVIDIA GPUs.
 | SFT | ✅ | ❌ |
 | GRPO | ✅ | ✅ |
 
+## Tutorials
+
+- [Minimal GRPO in PyTorch](tutorials/README.md) — a self-contained CUDA
+  implementation with data preparation, rewards, training, evaluation, and
+  checkpoint saving in one file.
+
 ## Shared requirements
 
 - Python >= 3.12
@@ -48,6 +54,9 @@ post-training-lab/
 │   └── gsm8k_eval.py
 ├── data_preparation/
 │   └── gsm8k.py             # Shared samples, DataLoaders, and answer matching
+├── tutorials/
+│   ├── README.md
+│   └── grpo_minimal_pytorch.py # Self-contained minimal PyTorch GRPO
 ├── checkpoints/             # Backend-qualified checkpoints (gitignored)
 └── runs/                    # Backend-qualified TensorBoard logs (gitignored)
 ```
