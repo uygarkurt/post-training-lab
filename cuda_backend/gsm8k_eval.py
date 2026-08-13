@@ -23,7 +23,7 @@ def validate(
     device = next(policy.parameters()).device
     val_loader = gsm8k.build_grpo_dataloader(
         val_dataset,
-        pad_id=tokenizer.pad_token_id,
+        tokenizer=tokenizer,
         batch_size=batch_size,
     )
 
