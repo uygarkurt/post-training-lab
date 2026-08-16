@@ -1,5 +1,3 @@
-"""Minimal GRPO training in PyTorch on an NVIDIA GPU."""
-
 import copy
 import os
 import random
@@ -154,52 +152,38 @@ def is_answer_correct(completion_text, ground_truth):
     return answers_match(predicted_answer, ground_truth)
 
 
-def answer_rewards(rollouts_text, ground_truth):
-    """Return binary rewards for decoded model completions."""
-    rewards = []
-
-    for text in rollouts_text:
-        is_correct = is_answer_correct(text, ground_truth)
-        rewards.append(1.0 if is_correct else 0.0)
-
-    return rewards
-
-
-def _make_grpo_collate_fn(pad_id):
+def _make_grpo_collate_fn(tokenizer):
     """Build a collator that left-pads GRPO prompts for generation."""
     def collate_fn(batch):
-        max_prompt_length = max(len(sample["prompt_ids"]) for sample in batch)
-        prompt_ids = []
-        prompt_attention_masks = []
-
-        for sample in batch:
-            padding_length = max_prompt_length - len(sample["prompt_ids"])
-            prompt_ids.append(
-                [pad_id] * padding_length + sample["prompt_ids"]
-            )
-            prompt_attention_masks.append(
-                [0] * padding_length + [1] * len(sample["prompt_ids"])
-            )
+        padded_prompts = tokenizer.pad(
+            {
+                "input_ids": [
+                    sample["prompt_ids"]
+                    for sample in batch
+                ]
+            },
+            padding=True,
+            padding_side="left",
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
 
         return {
-            "prompt_ids": torch.tensor(prompt_ids, dtype=torch.long),
-            "prompt_attention_mask": torch.tensor(
-                prompt_attention_masks,
-                dtype=torch.long,
-            ),
+            "prompt_ids": padded_prompts["input_ids"],
+            "prompt_attention_mask": padded_prompts["attention_mask"],
             "ground_truth": [sample["ground_truth"] for sample in batch],
         }
 
     return collate_fn
 
 
-def build_grpo_dataloader(dataset, pad_id, batch_size):
+def build_grpo_dataloader(dataset, tokenizer, batch_size):
     """Build a deterministic DataLoader of padded GRPO prompts."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=_make_grpo_collate_fn(pad_id),
+        collate_fn=_make_grpo_collate_fn(tokenizer),
         num_workers=0,
         drop_last=False,
     )
@@ -287,7 +271,7 @@ def validate(
     device = next(policy.parameters()).device
     val_loader = build_grpo_dataloader(
         val_dataset,
-        pad_id=tokenizer.pad_token_id,
+        tokenizer=tokenizer,
         batch_size=batch_size,
     )
 
@@ -331,6 +315,17 @@ def validate(
     return correct_answers / total_answers
 
 
+def answer_rewards(rollouts_text, ground_truth):
+    """Return binary rewards for decoded model completions."""
+    rewards = []
+
+    for text in rollouts_text:
+        is_correct = is_answer_correct(text, ground_truth)
+        rewards.append(1.0 if is_correct else 0.0)
+
+    return rewards
+
+
 def generate_rollouts(policy, prompt_tensor, group_size, max_new_tok, tokenizer):
     # All allowing mask. Removes EOS and PAD token ambiguity.
     prompt_attention_mask = torch.ones_like(prompt_tensor)
@@ -355,9 +350,8 @@ def generate_rollouts(policy, prompt_tensor, group_size, max_new_tok, tokenizer)
 
     # We have to include the first EOS token
     completion_mask = (is_eos_or_pad.cumsum(dim=-1) <= 1).long()  # [G, L]
-    truncated_rollouts = ~is_eos_or_pad.any(dim=-1)  # [G]
 
-    return completion_ids, completion_mask, truncated_rollouts
+    return completion_ids, completion_mask
 
 
 def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
@@ -387,7 +381,14 @@ def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
 
 
 def main():
-    """Train minimal GRPO and compare GSM8K test accuracy before and after."""
+    """Train minimal GRPO and compare GSM8K test accuracy before and after.
+
+    Tensor dimension notation:
+        G: Number of generated rollouts in a group.
+        P: Number of tokens in the prompt.
+        L: Number of generated completion tokens, excluding the prompt.
+        V: Number of tokens in the model vocabulary.
+    """
     os.makedirs(CHECKPOINT_DIRECTORY, exist_ok=True)
     print(f"Checkpoint directory: {CHECKPOINT_DIRECTORY}")
 
@@ -461,13 +462,13 @@ def main():
 
         prompt_tensor = torch.tensor(sample['prompt_ids'], dtype=torch.long, device="cuda").unsqueeze(0)  # [1, P]
 
-        rollouts, rollout_masks, _ = generate_rollouts(
+        rollouts, rollout_masks = generate_rollouts(
             policy,
             prompt_tensor,
             GROUP_SIZE,
             MAX_NEW_TOKENS,
             tokenizer,
-        )  # [G, L], [G, L], [G]
+        ) # [G, L], [G, L]
 
         with torch.no_grad():
             old_logprobs = token_logprobs(
@@ -485,7 +486,7 @@ def main():
             ) # [G, L]
 
         rollouts_text = tokenizer.batch_decode(rollouts, skip_special_tokens=True) # G
-
+        
         ground_truth = sample["ground_truth"]
         rewards = torch.tensor(
             answer_rewards(rollouts_text, ground_truth),
