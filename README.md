@@ -10,6 +10,11 @@ layer hiding the algorithm, and no need to trace a dozen files to understand a
 loss or training step. Implementations use native MLX on Apple Silicon and
 PyTorch with CUDA on NVIDIA GPUs.
 
+The implementations are designed to make post-training practical on consumer
+hardware rather than requiring datacenter GPUs. The experiments in this
+repository are run on an NVIDIA GeForce RTX 5060 Ti with 16 GB of VRAM and an
+Apple M4 chip.
+
 ## Choose a backend
 
 | Backend | Hardware | Status | Documentation |
@@ -26,9 +31,13 @@ PyTorch with CUDA on NVIDIA GPUs.
 
 ## Tutorials
 
-- [Minimal GRPO in PyTorch](tutorials/README.md) — a self-contained CUDA
-  implementation with data preparation, rewards, training, evaluation, and
-  checkpoint saving in one file.
+Each tutorial is a self-contained implementation that can be read and changed
+without navigating through the rest of the repository. See the
+[tutorial instructions](tutorials/README.md) for the general run command.
+
+| Tutorial | Backend | Code | Presentation | Video |
+| -------- | ------- | ---- | ------------ | ----- |
+| 👉 Minimal GRPO | PyTorch (CUDA) | [`grpo_minimal_pytorch.py`](tutorials/grpo_minimal_pytorch.py) | [View slides](tutorials/GRPO.pdf) | [Watch on YouTube](https://www.youtube.com/watch?v=vVJjUglOURs) |
 
 ## Shared requirements
 
