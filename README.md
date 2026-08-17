@@ -10,6 +10,11 @@ layer hiding the algorithm, and no need to trace a dozen files to understand a
 loss or training step. Implementations use native MLX on Apple Silicon and
 PyTorch with CUDA on NVIDIA GPUs.
 
+The implementations are designed to make post-training practical on consumer
+hardware rather than requiring datacenter GPUs. The experiments in this
+repository are run on an NVIDIA GeForce RTX 5060 Ti with 16 GB of VRAM and an
+Apple M4 chip.
+
 ## Choose a backend
 
 | Backend | Hardware | Status | Documentation |
@@ -23,6 +28,16 @@ PyTorch with CUDA on NVIDIA GPUs.
 | --------- | ------------------- | -------------- |
 | SFT | ✅ | ❌ |
 | GRPO | ✅ | ✅ |
+
+## Tutorials
+
+Each tutorial is a self-contained implementation that can be read and changed
+without navigating through the rest of the repository. See the
+[tutorial instructions](tutorials/README.md) for the general run command.
+
+| Tutorial | Backend | Code | Presentation | Video |
+| -------- | ------- | ---- | ------------ | ----- |
+| 👉 Minimal GRPO | PyTorch (CUDA) | [`grpo_minimal_pytorch.py`](tutorials/grpo_minimal_pytorch.py) | [View slides](tutorials/GRPO.pdf) | [Watch on YouTube](https://www.youtube.com/watch?v=vVJjUglOURs) |
 
 ## Shared requirements
 
@@ -48,6 +63,9 @@ post-training-lab/
 │   └── gsm8k_eval.py
 ├── data_preparation/
 │   └── gsm8k.py             # Shared samples, DataLoaders, and answer matching
+├── tutorials/
+│   ├── README.md
+│   └── grpo_minimal_pytorch.py # Self-contained minimal PyTorch GRPO
 ├── checkpoints/             # Backend-qualified checkpoints (gitignored)
 └── runs/                    # Backend-qualified TensorBoard logs (gitignored)
 ```

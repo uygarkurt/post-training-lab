@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create Minimal PyTorch Tutorial"
+  short_description: "Build self-contained tutorials from canonical code"
+  default_prompt: "Use $create-minimal-pytorch-tutorial to create a minimal PyTorch tutorial for an algorithm from its canonical implementation."

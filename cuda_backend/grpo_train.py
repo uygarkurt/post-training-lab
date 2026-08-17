@@ -236,6 +236,13 @@ def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
 
 
 def main():
+    """
+    Tensor dimension notation:
+        G: Number of generated rollouts in a group.
+        P: Number of tokens in the prompt.
+        L: Number of generated completion tokens, excluding the prompt.
+        V: Number of tokens in the model vocabulary.
+    """
     args = parse_args()
     saved_args = vars(args).copy()
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")

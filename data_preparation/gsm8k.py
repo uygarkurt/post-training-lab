@@ -249,41 +249,38 @@ def answer_rewards(rollouts_text, ground_truth):
     return rewards
 
 
-def _make_grpo_collate_fn(pad_id):
+def _make_grpo_collate_fn(tokenizer):
     """Build a collator that left-pads GRPO prompts for generation."""
     def collate_fn(batch):
-        max_prompt_length = max(len(sample["prompt_ids"]) for sample in batch)
-        prompt_ids = []
-        prompt_attention_masks = []
-
-        for sample in batch:
-            padding_length = max_prompt_length - len(sample["prompt_ids"])
-            prompt_ids.append(
-                [pad_id] * padding_length + sample["prompt_ids"]
-            )
-            prompt_attention_masks.append(
-                [0] * padding_length + [1] * len(sample["prompt_ids"])
-            )
+        padded_prompts = tokenizer.pad(
+            {
+                "input_ids": [
+                    sample["prompt_ids"]
+                    for sample in batch
+                ]
+            },
+            padding=True,
+            padding_side="left",
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
 
         return {
-            "prompt_ids": torch.tensor(prompt_ids, dtype=torch.long),
-            "prompt_attention_mask": torch.tensor(
-                prompt_attention_masks,
-                dtype=torch.long,
-            ),
+            "prompt_ids": padded_prompts["input_ids"],
+            "prompt_attention_mask": padded_prompts["attention_mask"],
             "ground_truth": [sample["ground_truth"] for sample in batch],
         }
 
     return collate_fn
 
 
-def build_grpo_dataloader(dataset, pad_id, batch_size):
+def build_grpo_dataloader(dataset, tokenizer, batch_size):
     """Build a deterministic DataLoader of padded GRPO prompts."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=_make_grpo_collate_fn(pad_id),
+        collate_fn=_make_grpo_collate_fn(tokenizer),
         num_workers=0,
         drop_last=False,
     )
