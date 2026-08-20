@@ -236,11 +236,22 @@ def main():
     # ---- Load and tokenise data --------------------------------------------
     print("Loading dataset ...")
     if args.dataset == "gsm8k":
-        train_loader, val_loader = gsm8k.build_sft_dataloaders(
+        train_dataset, val_dataset = (
+            gsm8k.GSM8KSFTDataset.build_train_val_datasets(
+                tokenizer,
+                max_seq_len=args.max_seq_len,
+                val_split=args.val_split,
+                seed=args.seed,
+            )
+        )
+        train_loader = gsm8k.build_sft_dataloader(
+            train_dataset,
             tokenizer,
-            max_seq_len=args.max_seq_len,
-            val_split=args.val_split,
-            seed=args.seed,
+            batch_size=args.batch_size,
+        )
+        val_loader = gsm8k.build_sft_dataloader(
+            val_dataset,
+            tokenizer,
             batch_size=args.batch_size,
         )
     else:

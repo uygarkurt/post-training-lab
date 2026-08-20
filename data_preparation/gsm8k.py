@@ -7,11 +7,14 @@ converting returned batches to their native tensors and running model code.
 
 Public API
 ----------
-build_sft_samples(...)
-    Return train/validation lists of (input_ids, loss_mask) pairs.
+GSM8KSFTDataset.build_train_val_datasets(...)
+    Return train/validation PyTorch Datasets of SFT examples.
 
-build_sft_dataloaders(...)
-    Return PyTorch DataLoaders that yield padded input and mask tensors.
+GSM8KSFTDataset.build_debug_overfit_datasets(...)
+    Return matching tiny train/validation Datasets for SFT smoke tests.
+
+build_sft_dataloader(...)
+    Return batches of right-padded SFT examples and loss masks.
 
 GSM8KGRPODataset.build_train_val_datasets(...)
     Return train/validation PyTorch Datasets of prompt dictionaries.
@@ -26,7 +29,6 @@ answer_rewards(...)
     Return GSM8K answer-correctness rewards for decoded model completions.
 """
 
-import random
 import re
 
 import torch
@@ -46,18 +48,95 @@ _ANSWER_IS_RE = re.compile(
 _NUMBER_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
 
 
-def _load_rows(split=DATASET_SPLIT):
-    return hf_load_dataset(DATASET_NAME, DATASET_SUBSET, split=split)
+# =============================================================================
+# SFT DATASET PREPARATION
+# =============================================================================
 
 
-# SFT preparation
+def _make_sft_collate_fn(tokenizer):
+    """Build a collator that pads samples into PyTorch tensors."""
+    def collate_fn(batch):
+        padded_batch = tokenizer.pad(
+            {
+                "input_ids": [sample["input_ids"] for sample in batch],
+                "attention_mask": [sample["loss_mask"] for sample in batch],
+            },
+            padding=True,
+            padding_side="right",
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+
+        return (
+            padded_batch["input_ids"],
+            padded_batch["attention_mask"].to(torch.float32),
+        )
+
+    return collate_fn
+
+
+def build_sft_dataloader(dataset, tokenizer, batch_size):
+    """Build a deterministic DataLoader of padded SFT examples."""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=_make_sft_collate_fn(tokenizer),
+        num_workers=0,
+        drop_last=False,
+    )
 
 
 class GSM8KSFTDataset(Dataset):
-    """Hold tokenized (input_ids, loss_mask) samples."""
+    """Tokenize and hold GSM8K prompt-answer examples for SFT."""
 
-    def __init__(self, samples):
-        self.samples = samples
+    def __init__(self, tokenizer, max_seq_len, max_prompt_len=None, split=DATASET_SPLIT):
+        self.samples = []
+        self.skipped = 0
+
+        for row in hf_load_dataset(DATASET_NAME, DATASET_SUBSET, split=split):
+            question = row["question"]
+            answer = row["answer"]
+
+            prompt_text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": question}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            full_text = tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer},
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+
+            prompt_ids = tokenizer.encode(prompt_text)
+            full_ids = tokenizer.encode(full_text)
+
+            if max_prompt_len is not None and len(prompt_ids) >= max_prompt_len:
+                self.skipped += 1
+                continue
+
+            if len(full_ids) < 4 or len(prompt_ids) >= len(full_ids):
+                self.skipped += 1
+                continue
+
+            full_ids = full_ids[:max_seq_len]
+            prompt_len = min(len(prompt_ids), len(full_ids))
+            loss_mask = [0] * prompt_len + [1] * (len(full_ids) - prompt_len)
+
+            if sum(loss_mask) == 0:
+                self.skipped += 1
+                continue
+
+            self.samples.append(
+                {
+                    "input_ids": full_ids,
+                    "loss_mask": loss_mask,
+                }
+            )
 
     def __len__(self):
         return len(self.samples)
@@ -65,126 +144,73 @@ class GSM8KSFTDataset(Dataset):
     def __getitem__(self, index):
         return self.samples[index]
 
-
-def _make_sft_collate_fn(pad_id):
-    """Build a collator that pads samples into PyTorch tensors."""
-    def collate_fn(batch):
-        batch_ids = [item[0] for item in batch]
-        batch_masks = [item[1] for item in batch]
-        max_len = max(len(input_ids) for input_ids in batch_ids)
-
-        padded_ids = []
-        padded_masks = []
-        for input_ids, loss_mask in zip(batch_ids, batch_masks):
-            pad = max_len - len(input_ids)
-            padded_ids.append(input_ids + [pad_id] * pad)
-            padded_masks.append(loss_mask + [0] * pad)
-
-        return (
-            torch.tensor(padded_ids, dtype=torch.long),
-            torch.tensor(padded_masks, dtype=torch.float32),
-        )
-
-    return collate_fn
-
-
-def build_sft_samples(
-    tokenizer,
-    max_seq_len,
-    val_split,
-    seed,
-):
-    """Tokenize GSM8K and return backend-neutral SFT train/validation samples."""
-    samples = []
-    skipped = 0
-
-    for row in _load_rows():
-        question = row["question"]
-        answer = row["answer"]
-
-        prompt_text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": question}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        full_text = tokenizer.apply_chat_template(
-            [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": answer},
-            ],
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-
-        prompt_ids = tokenizer.encode(prompt_text)
-        full_ids = tokenizer.encode(full_text)
-
-        if len(full_ids) < 4 or len(prompt_ids) >= len(full_ids):
-            skipped += 1
-            continue
-
-        full_ids = full_ids[:max_seq_len]
-        prompt_len = min(len(prompt_ids), len(full_ids))
-        loss_mask = [0] * prompt_len + [1] * (len(full_ids) - prompt_len)
-
-        if sum(loss_mask) == 0:
-            skipped += 1
-            continue
-
-        samples.append((full_ids, loss_mask))
-
-    rng = random.Random(seed)
-    rng.shuffle(samples)
-
-    n_val = max(1, int(len(samples) * val_split))
-    val_samples = samples[:n_val]
-    train_samples = samples[n_val:]
-
-    print(
-        f"  {len(samples)} samples loaded, {skipped} skipped  "
-        f"→  {len(train_samples)} train / {len(val_samples)} val  "
-        f"({val_split * 100:.0f}% val split)."
-    )
-    return train_samples, val_samples
-
-
-def build_sft_dataloaders(
-    tokenizer,
-    max_seq_len,
-    val_split,
-    seed,
-    batch_size,
-):
-    """Build deterministic PyTorch DataLoaders for SFT."""
-    train_samples, val_samples = build_sft_samples(
+    @classmethod
+    def build_train_val_datasets(
+        cls,
         tokenizer,
-        max_seq_len=max_seq_len,
-        val_split=val_split,
-        seed=seed,
-    )
-    collate = _make_sft_collate_fn(tokenizer.pad_token_id)
+        max_seq_len,
+        val_split,
+        seed,
+        max_prompt_len=None,
+    ):
+        """Build SFT train and validation datasets."""
+        dataset = cls(
+            tokenizer,
+            max_seq_len=max_seq_len,
+            max_prompt_len=max_prompt_len,
+        )
 
-    train_loader = DataLoader(
-        GSM8KSFTDataset(train_samples),
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate,
-        num_workers=0,
-        drop_last=True,
-        generator=torch.Generator().manual_seed(seed),
-    )
-    val_loader = DataLoader(
-        GSM8KSFTDataset(val_samples),
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate,
-        num_workers=0,
-        drop_last=False,
-    )
-    return train_loader, val_loader
+        n_val = max(1, int(len(dataset) * val_split))
+        n_train = len(dataset) - n_val
+        train_dataset, val_dataset = random_split(
+            dataset,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(seed),
+        )
+
+        print(
+            f"  {len(dataset)} samples loaded, {dataset.skipped} skipped  "
+            f"→  {len(train_dataset)} train / {len(val_dataset)} val  "
+            f"({val_split * 100:.0f}% val split)."
+        )
+        return train_dataset, val_dataset
+
+    @classmethod
+    def build_debug_overfit_datasets(
+        cls,
+        tokenizer,
+        max_seq_len,
+        seed,
+        debug_samples,
+        max_prompt_len=None,
+    ):
+        """Build matching tiny train and validation datasets."""
+        dataset = cls(
+            tokenizer,
+            max_seq_len=max_seq_len,
+            max_prompt_len=max_prompt_len,
+        )
+
+        shuffled_indices = torch.randperm(
+            len(dataset),
+            generator=torch.Generator().manual_seed(seed),
+        ).tolist()
+        debug_indices = shuffled_indices[: min(debug_samples, len(dataset))]
+
+        train_dataset = Subset(dataset, debug_indices)
+        val_dataset = Subset(dataset, debug_indices)
+
+        print(
+            f"  {len(dataset)} samples loaded, {dataset.skipped} skipped  "
+            f"→  debug overfit: {len(train_dataset)} GSM8K samples "
+            "(same set for train and val)."
+        )
+        return train_dataset, val_dataset
 
 
-# GRPO preparation and rewards
+# =============================================================================
+# GRPO DATASET PREPARATION AND REWARDS
+# =============================================================================
 
 
 def _normalize_number(raw):
@@ -293,7 +319,7 @@ class GSM8KGRPODataset(Dataset):
         self.samples = []
         self.skipped = 0
 
-        for row in _load_rows(split):
+        for row in hf_load_dataset(DATASET_NAME, DATASET_SUBSET, split=split):
             question = row["question"]
             answer = row["answer"]
 

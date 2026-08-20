@@ -58,6 +58,7 @@ post-training-lab/
 │   ├── generate_text.py
 │   └── gsm8k_eval.py
 ├── cuda_backend/            # Runnable PyTorch implementation
+│   ├── sft_train.py         # SFT scaffold with an exposed training loop
 │   ├── grpo_train.py
 │   ├── generate_text.py
 │   └── gsm8k_eval.py

@@ -5,6 +5,7 @@ currently implemented.
 
 The available entrypoints are:
 
+- `sft_train.py` (CUDA SFT scaffold with an exposed training loop)
 - `grpo_train.py`
 - `generate_text.py`
 - `gsm8k_eval.py`
@@ -13,6 +14,12 @@ Install the CUDA dependencies from the repository root:
 
 ```bash
 uv sync --extra cuda
+```
+
+Build on the CUDA SFT scaffold, then run it with:
+
+```bash
+uv run --extra cuda -m cuda_backend.sft_train
 ```
 
 Train the default model with GRPO and LoRA:

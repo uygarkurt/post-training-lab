@@ -68,6 +68,33 @@ multiple abstraction layers.
   PyTorch and MLX operations when that makes each implementation clearer.
 - Do not change shared data code solely to accommodate one backend.
 
+## CUDA training script consistency
+
+- Use the existing scripts in `cuda_backend/` as the starting point when
+  adding a new algorithm. Choose the closest CUDA training script as the
+  structural reference instead of deriving the new entrypoint from MLX or a
+  tutorial implementation.
+- Match shared CLI argument names, meanings, defaults, grouping, and ordering
+  across CUDA training scripts whenever the underlying behavior is the same.
+  Do not add separate controls for behavior that is intentionally shared, such
+  as using one SFT batch size for both training and validation.
+- Keep the training presentation consistent: use the same timestamped run
+  directories, `args.json` and `out.log` capture, progress-bar style, terminal
+  messages, TensorBoard metric naming, and logging cadence where applicable.
+- Match the validation lifecycle where applicable, including initial
+  validation, periodic validation controlled by `--eval-every`, and the same
+  disable semantics.
+- Match checkpoint paths, step naming, periodic and final-save behavior, and
+  tokenizer/model-or-adapter serialization. Saved outputs should work with the
+  existing CUDA generation, evaluation, and subsequent-training entrypoints.
+- Keep shared model-loading behavior aligned, including base models, optional
+  adapters, LoRA versus full training, trainable-parameter reporting, dtype,
+  and device placement where the algorithm permits it.
+- Differences are expected when algorithms genuinely require different data,
+  optimization, generation, evaluation, logging, or checkpoint state. Keep
+  those differences explicit and local, and do not introduce meaningless
+  arguments solely for surface-level uniformity.
+
 ## Verification
 
 - Run focused, inexpensive checks where possible.
