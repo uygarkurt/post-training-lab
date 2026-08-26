@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -160,11 +161,11 @@ def load_model_and_tokenizer(args):
 
 @torch.inference_mode()
 def calculate_validation_loss(model, val_loader):
-    """Return token-weighted validation loss over the validation loader."""
+    """Return response-token-weighted loss over the validation loader."""
     was_training = model.training
     model.eval()
     total_loss = 0.0
-    total_supervised_tokens = 0
+    total_response_token_count = 0
 
     for input_ids, response_token_mask in tqdm(
         val_loader,
@@ -172,25 +173,33 @@ def calculate_validation_loss(model, val_loader):
         leave=False,
         unit="batch",
     ):
-        input_ids = input_ids.to("cuda")
-        response_token_mask = response_token_mask.to("cuda")
+        input_ids = input_ids.to("cuda")  # [B, L]
+        response_token_mask = response_token_mask.to("cuda")  # [B, L]
 
-        # TODO: Implement the validation SFT objective here. Calculate and set:
-        #   loss: scalar validation loss for this batch
-        #   supervised_tokens: scalar number of response tokens in this batch
-        raise NotImplementedError(
-            "Implement validation loss in calculate_validation_loss()"
-        )
-        token_count = int(supervised_tokens.item())
-        total_loss += loss.float().item() * token_count
-        total_supervised_tokens += token_count
+        logits = model(input_ids).logits  # [B, L, V]
+
+        logits_shifted = logits[:, :-1, :]  # [B, L-1, V]
+        targets = input_ids[:, 1:]  # [B, L-1]
+        response_token_mask_shifted = response_token_mask[:, 1:]  # [B, L-1]
+
+        ce_loss = F.cross_entropy(
+            logits_shifted.transpose(1, 2),  # [B, V, L-1]
+            targets,
+            reduction="none",
+        )  # [B, L-1]
+
+        masked_ce_loss = ce_loss * response_token_mask_shifted
+        response_token_count = int(response_token_mask_shifted.sum().item())
+
+        total_loss += masked_ce_loss.float().sum().item()
+        total_response_token_count += response_token_count
 
     if was_training:
         model.train()
 
-    if total_supervised_tokens == 0:
+    if total_response_token_count == 0:
         return float("nan")
-    return total_loss / total_supervised_tokens
+    return total_loss / total_response_token_count
 
 
 def save_checkpoint(model, tokenizer, checkpoint_dir, step):

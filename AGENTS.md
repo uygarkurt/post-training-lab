@@ -62,6 +62,12 @@ multiple abstraction layers.
   `cuda_backend/`.
 - Implement new algorithms and major algorithm changes in CUDA first, then
   mirror them in MLX without changing the shared data contract.
+- Treat established variable names in `cuda_backend/` as canonical for shared
+  LLM-training concepts. Before introducing a variable, search the existing
+  CUDA implementations for the same value and reuse its name when the
+  semantics match; carry that name into corresponding MLX implementations.
+  Introduce a different name only when the value has genuinely different
+  semantics, and keep that difference explicit.
 - Keep corresponding backend filenames, CLI options, section order, variable
   names, and mathematical steps aligned where practical.
 - Prefer structural parity over literal line-for-line identity. Use native
