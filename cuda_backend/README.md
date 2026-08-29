@@ -28,12 +28,16 @@ Train the default model with GRPO and LoRA:
 uv run --extra cuda -m cuda_backend.grpo_train
 ```
 
+Runs are saved under `runs/cuda/<algorithm>/<algorithm>_<timestamp>/`, with
+matching checkpoints under
+`checkpoints/cuda/<algorithm>/<algorithm>_<timestamp>/`.
+
 To continue training from an existing PEFT adapter checkpoint:
 
 ```bash
 uv run --extra cuda -m cuda_backend.grpo_train \
   --model Qwen/Qwen2-0.5B-Instruct \
-  --adapter ./checkpoints/cuda/grpo_<timestamp>/step_000100
+  --adapter ./checkpoints/cuda/grpo/grpo_<timestamp>/step_000100
 ```
 
 Generate from a Hugging Face model:
@@ -46,7 +50,7 @@ To generate from a PEFT adapter checkpoint, pass its directory:
 
 ```bash
 uv run --extra cuda -m cuda_backend.generate_text \
-  --model_path ./checkpoints/cuda/grpo_<timestamp>/step_000100 \
+  --model_path ./checkpoints/cuda/grpo/grpo_<timestamp>/step_000100 \
   --load-adapter
 ```
 
@@ -54,7 +58,7 @@ Evaluate a PEFT adapter checkpoint on the GSM8K test split:
 
 ```bash
 uv run --extra cuda -m cuda_backend.gsm8k_eval \
-  --model_path ./checkpoints/cuda/grpo_<timestamp>/step_000100 \
+  --model_path ./checkpoints/cuda/grpo/grpo_<timestamp>/step_000100 \
   --load-adapter
 ```
 

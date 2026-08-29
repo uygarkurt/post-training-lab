@@ -71,8 +71,9 @@ post-training-lab/
 └── runs/                    # Backend-qualified TensorBoard logs (gitignored)
 ```
 
-PyTorch/CUDA GRPO runs use `runs/cuda/grpo_<timestamp>/` with matching
-checkpoints in `checkpoints/cuda/grpo_<timestamp>/`.
+Training runs use `runs/<backend>/<algorithm>/<algorithm>_<timestamp>/` with
+matching checkpoints in
+`checkpoints/<backend>/<algorithm>/<algorithm>_<timestamp>/`.
 
 Generate text or evaluate a PyTorch/CUDA checkpoint on the GSM8K test split:
 

@@ -23,19 +23,23 @@ uv sync --extra mlx
 The pipeline is supervised fine-tuning, GRPO, then generation:
 
 ```bash
-# 1. SFT: saves fused model + adapters under checkpoints/mlx/sft/
+# 1. SFT: saves fused model + adapters in a timestamped SFT directory
 uv run --extra mlx -m mlx_backend.sft_train
 
 # 2. GRPO: continue from an SFT adapter checkpoint
 uv run --extra mlx -m mlx_backend.grpo_train \
-  --model ./checkpoints/mlx/sft/step_000500 \
+  --model ./checkpoints/mlx/sft/sft_<timestamp>/step_000500 \
   --load-adapter
 
 # 3. Generate from a GRPO adapter checkpoint
 uv run --extra mlx -m mlx_backend.generate_text \
-  --model_path ./checkpoints/mlx/grpo/step_000050 \
+  --model_path ./checkpoints/mlx/grpo/grpo_<timestamp>/step_000050 \
   --load-adapter
 ```
+
+Runs are saved under `runs/mlx/<algorithm>/<algorithm>_<timestamp>/`, with
+matching checkpoints under
+`checkpoints/mlx/<algorithm>/<algorithm>_<timestamp>/`.
 
 ## Fast smoke test
 
