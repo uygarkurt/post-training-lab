@@ -167,31 +167,31 @@ def calculate_validation_loss(model, val_loader):
     total_loss = 0.0
     total_response_token_count = 0
 
-    for input_ids, response_token_mask in tqdm(
+    for input_ids, loss_mask in tqdm(
         val_loader,
         desc="eval",
         leave=False,
         unit="batch",
     ):
         input_ids = input_ids.to("cuda")  # [B, L]
-        response_token_mask = response_token_mask.to("cuda")  # [B, L]
+        loss_mask = loss_mask.to("cuda")  # [B, L]
 
         logits = model(input_ids).logits  # [B, L, V]
 
         logits_shifted = logits[:, :-1, :]  # [B, L-1, V]
         targets = input_ids[:, 1:]  # [B, L-1]
-        response_token_mask_shifted = response_token_mask[:, 1:]  # [B, L-1]
+        loss_mask_shifted = loss_mask[:, 1:]  # [B, L-1]
 
-        ce_loss = F.cross_entropy(
+        ce = F.cross_entropy(
             logits_shifted.transpose(1, 2),  # [B, V, L-1]
             targets,
             reduction="none",
         )  # [B, L-1]
 
-        masked_ce_loss = ce_loss * response_token_mask_shifted
-        response_token_count = int(response_token_mask_shifted.sum().item())
+        masked_ce = ce * loss_mask_shifted
+        response_token_count = int(loss_mask_shifted.sum().item())
 
-        total_loss += masked_ce_loss.float().sum().item()
+        total_loss += masked_ce.float().sum().item()
         total_response_token_count += response_token_count
 
     if was_training:
@@ -295,26 +295,33 @@ def main():
     completed_steps = 0
 
     while completed_steps < args.num_iters:
-        for input_ids, response_token_mask in train_loader:
+        for input_ids, loss_mask in train_loader:
             if completed_steps >= args.num_iters:
                 break
 
             step = completed_steps + 1
             step_start_time = time.time()
-            input_ids = input_ids.to("cuda")
-            response_token_mask = response_token_mask.to("cuda")
-
-            raise NotImplementedError("Implement the SFT objective")
-            # TODO: Implement the SFT objective here. The dataloader provides
-            # tokenized prompt-response input_ids and a response-token mask.
-            # Calculate and set:
-            #   loss: scalar training loss for this batch
-            #   supervised_tokens: scalar number of response tokens in this batch
-            raise NotImplementedError(
-                "Implement the SFT objective in the training loop"
-            )
+            input_ids = input_ids.to("cuda")  # [B, L]
+            loss_mask = loss_mask.to("cuda")  # [B, L]
 
             optimizer.zero_grad(set_to_none=True)
+
+            logits = model(input_ids).logits  # [B, L, V]
+
+            logits_shifted = logits[:, :-1, :]  # [B, L-1, V]
+            targets = input_ids[:, 1:]  # [B, L-1]
+            loss_mask_shifted = loss_mask[:, 1:]  # [B, L-1]
+
+            ce = F.cross_entropy(
+                logits_shifted.transpose(1, 2),
+                targets,
+                reduction="none",
+            )  # [B, L-1]
+
+            masked_ce = ce * loss_mask_shifted  # [B, L-1]
+            response_token_count = loss_mask_shifted.sum()
+            loss = masked_ce.sum() / response_token_count
+
             loss.backward()
 
             gradient_norm = torch.nn.utils.clip_grad_norm_(
@@ -326,8 +333,8 @@ def main():
 
             loss_value = loss.detach().float().item()
             gradient_norm_value = gradient_norm.detach().float().item()
-            supervised_token_count = int(supervised_tokens.detach().item())
-            tokens_per_second = supervised_token_count / max(
+            response_token_count = int(response_token_count.detach().item())
+            tokens_per_second = response_token_count / max(
                 time.time() - step_start_time,
                 1e-8,
             )
@@ -336,7 +343,7 @@ def main():
             writer.add_scalar("train/loss", loss_value, step)
             writer.add_scalar("train/grad_norm", gradient_norm_value, step)
             writer.add_scalar("train/learning_rate", args.lr, step)
-            writer.add_scalar("train/supervised_tokens", supervised_token_count, step)
+            writer.add_scalar("train/response_tokens", response_token_count, step)
             writer.add_scalar("train/tokens_per_sec", tokens_per_second, step)
 
             progress.set_description(f"train loss={loss_value:.4f}")
