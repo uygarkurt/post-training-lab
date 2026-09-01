@@ -7,15 +7,13 @@ import sys
 import time
 from datetime import UTC, datetime
 
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
 import numpy as np
-from mlx.utils import tree_flatten
-from mlx_lm import load
-from mlx_lm.tuner.utils import linear_to_lora_layers
-from tensorboardX import SummaryWriter
+import torch
+import torch.nn.functional as F
+from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from data_preparation import gsm8k
 
@@ -23,7 +21,7 @@ from data_preparation import gsm8k
 def parse_args():
     """Parse the small set of options needed by the SFT scaffold."""
     parser = argparse.ArgumentParser(
-        description="SFT for MLX (Apple Silicon).",
+        description="SFT for CUDA (NVIDIA GPU).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -37,8 +35,16 @@ def parse_args():
     )
     parser.add_argument(
         "--model", type=str,
-        default="Qwen/Qwen2-0.5B-Instruct-MLX",
-        help="Hugging Face model or local model directory",
+        default="Qwen/Qwen2-0.5B-Instruct",
+        help="Hugging Face base model, merged model, or local model directory",
+    )
+    parser.add_argument(
+        "--adapter", type=str, default=None,
+        help="Optional PEFT adapter checkpoint used to initialize the model",
+    )
+    parser.add_argument(
+        "--train-mode", choices=("lora", "full"), default="lora",
+        help="Train LoRA parameters only, or all parameters of a dense model",
     )
 
     parser.add_argument("--batch-size", type=int, default=2, help="Per-step batch size")
@@ -53,20 +59,16 @@ def parse_args():
 
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank (r)")
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha (scale = alpha / rank)")
-    parser.add_argument(
-        "--lora-layers", type=int, default=-1,
-        help="Number of final transformer layers using LoRA (-1 for all layers)",
-    )
 
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization and data shuffling")
     parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from GSM8K train set")
     parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
     parser.add_argument("--eval-every", type=int, default=50, help="Validate every N steps after the initial validation (-1 to disable)")
 
-    parser.add_argument("--tensorboard-dir", type=str, default="./runs/mlx/sft", help="Base path for timestamped TensorBoard run directories")
+    parser.add_argument("--tensorboard-dir", type=str, default="./runs/cuda/sft", help="Base path for timestamped TensorBoard run directories")
 
     parser.add_argument("--save-every", type=int, default=100, help="Save a model checkpoint every N steps (0 to disable)")
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/mlx/sft", help="Base path for timestamped checkpoint directories")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/cuda/sft", help="Base path for timestamped checkpoint directories")
 
     args = parser.parse_args()
     if args.batch_size < 1:
@@ -83,45 +85,81 @@ def parse_args():
         parser.error("--val-split must be between 0 and 1")
     if args.lora_rank < 1:
         parser.error("--lora-rank must be at least 1")
-    if args.lora_layers == 0 or args.lora_layers < -1:
-        parser.error("--lora-layers must be -1 or at least 1")
     return args
 
 
 def set_random_seed(seed):
-    """Seed Python, NumPy, and MLX for repeatable execution."""
+    """Seed Python, NumPy, and PyTorch for deterministic CUDA execution."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
-    mx.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
 
 
-def to_mlx_batch(batch_item, dtype):
-    """Convert a PyTorch DataLoader item to an MLX array."""
-    if isinstance(batch_item, mx.array):
-        return batch_item.astype(dtype)
-    return mx.array(batch_item.numpy(), dtype=dtype)
+def load_model_and_tokenizer(args):
+    """Load a dense model or trainable adapter using the CUDA training conventions."""
+    print(f"Loading model {args.model} ...")
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype="bfloat16").to("cuda")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    if args.adapter:
+        adapter_config = PeftConfig.from_pretrained(args.adapter)
+        adapter_base = adapter_config.base_model_name_or_path
+        if adapter_base and adapter_base != args.model:
+            print(
+                "Warning: the adapter reports base model "
+                f"'{adapter_base}', but --model is '{args.model}'."
+            )
+
+        continue_adapter_training = args.train_mode == "lora"
+        print(f"Loading adapter {args.adapter} ...")
+        model = PeftModel.from_pretrained(
+            model,
+            args.adapter,
+            is_trainable=continue_adapter_training,
+        )
+
+        if args.train_mode == "full":
+            print("Merging adapter into the model for full training ...")
+            model = model.merge_and_unload()
+            model.requires_grad_(True)
+
+    elif args.train_mode == "lora":
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=0.0,
+            target_modules="all-linear",
+        )
+        print("Applying new LoRA adapters to all linear layers ...")
+        model = get_peft_model(model, lora_config)
+
+    else:
+        model.requires_grad_(True)
+
+    model.config.use_cache = False
+
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    print(
+        f"Training mode: {args.train_mode} | "
+        f"{trainable_parameters:,} / {total_parameters:,} parameters trainable"
+    )
+    return model, tokenizer
 
 
-def sft_loss(model, input_ids, loss_mask):
-    """Return response-token SFT loss and the supervised token count."""
-    logits = model(input_ids)  # [B, L, V]
-
-    logits_shifted = logits[:, :-1, :]  # [B, L-1, V]
-    targets = input_ids[:, 1:]  # [B, L-1]
-    loss_mask_shifted = loss_mask[:, 1:]  # [B, L-1]
-
-    cross_entropy = nn.losses.cross_entropy(
-        logits_shifted,
-        targets,
-        reduction="none",
-    )  # [B, L-1]
-
-    masked_cross_entropy = cross_entropy * loss_mask_shifted
-    response_token_count = loss_mask_shifted.sum()
-    loss = masked_cross_entropy.sum() / response_token_count
-    return loss, response_token_count
-
-
+@torch.inference_mode()
 def calculate_validation_loss(model, val_loader):
     """Return response-token-weighted loss over the validation loader."""
     was_training = model.training
@@ -135,14 +173,26 @@ def calculate_validation_loss(model, val_loader):
         leave=False,
         unit="batch",
     ):
-        input_ids = to_mlx_batch(input_ids, mx.int32)  # [B, L]
-        loss_mask = to_mlx_batch(loss_mask, mx.float32)  # [B, L]
-        loss, response_token_count = sft_loss(model, input_ids, loss_mask)
-        mx.eval(loss, response_token_count)
+        input_ids = input_ids.to("cuda")  # [B, L]
+        loss_mask = loss_mask.to("cuda")  # [B, L]
 
-        response_token_count_value = int(response_token_count.item())
-        total_loss += loss.item() * response_token_count_value
-        total_response_token_count += response_token_count_value
+        logits = model(input_ids).logits  # [B, L, V]
+
+        logits_shifted = logits[:, :-1, :]  # [B, L-1, V]
+        targets = input_ids[:, 1:]  # [B, L-1]
+        loss_mask_shifted = loss_mask[:, 1:]  # [B, L-1]
+
+        ce = F.cross_entropy(
+            logits_shifted.transpose(1, 2),  # [B, V, L-1]
+            targets,
+            reduction="none",
+        )  # [B, L-1]
+
+        masked_ce = ce * loss_mask_shifted
+        response_token_count = int(loss_mask_shifted.sum().item())
+
+        total_loss += masked_ce.float().sum().item()
+        total_response_token_count += response_token_count
 
     if was_training:
         model.train()
@@ -152,52 +202,11 @@ def calculate_validation_loss(model, val_loader):
     return total_loss / total_response_token_count
 
 
-def save_checkpoint(model, checkpoint_dir, step, args):
-    """Save MLX adapter weights and a fused model for one step."""
+def save_checkpoint(model, tokenizer, checkpoint_dir, step):
+    """Save a full model or PEFT adapter and tokenizer for one step."""
     checkpoint_path = os.path.join(checkpoint_dir, f"step_{step:06d}")
-    os.makedirs(checkpoint_path, exist_ok=True)
-
-    adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-    mx.save_safetensors(
-        os.path.join(checkpoint_path, "adapters.safetensors"),
-        adapter_weights,
-    )
-
-    adapter_config = {
-        "fine_tune_type": "lora",
-        "base_model": args.model,
-        "num_layers": args.lora_layers,
-        "lora_parameters": {
-            "rank": args.lora_rank,
-            "scale": args.lora_alpha / args.lora_rank,
-            "dropout": 0.0,
-        },
-    }
-    with open(
-        os.path.join(checkpoint_path, "adapter_config.json"),
-        "w",
-    ) as adapter_config_file:
-        json.dump(adapter_config, adapter_config_file, indent=2)
-
-    fuse_result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "mlx_lm.fuse",
-            "--model",
-            args.model,
-            "--adapter-path",
-            checkpoint_path,
-            "--save-path",
-            checkpoint_path,
-        ],
-        capture_output=True,
-        text=True,
-    )
-
-    if fuse_result.returncode != 0:
-        print(f"  Warning: mlx_lm.fuse failed at step {step}:")
-        print(fuse_result.stderr.strip())
+    model.save_pretrained(checkpoint_path)
+    tokenizer.save_pretrained(checkpoint_path)
     print(f"  [ckpt] step {step:5d} -> {checkpoint_path}")
 
 
@@ -235,44 +244,7 @@ def main():
     print(f"Checkpoint directory: {args.checkpoint_dir}")
 
     set_random_seed(args.seed)
-
-    print(f"Loading model {args.model} ...")
-    model, tokenizer = load(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    if args.lora_layers > len(model.layers):
-        raise ValueError(
-            f"Requested LoRA for {args.lora_layers} layers, but the model "
-            f"only has {len(model.layers)} layers."
-        )
-
-    model.freeze()
-    lora_config = {
-        "rank": args.lora_rank,
-        "scale": args.lora_alpha / args.lora_rank,
-        "dropout": 0.0,
-    }
-    linear_to_lora_layers(
-        model,
-        num_layers=args.lora_layers,
-        config=lora_config,
-    )
-
-    trainable_parameters = list(tree_flatten(model.trainable_parameters()))
-    trainable_parameter_count = sum(
-        parameter.size
-        for _, parameter in trainable_parameters
-    )
-    total_parameter_count = sum(
-        parameter.size
-        for _, parameter in tree_flatten(model.parameters())
-    )
-    print(
-        "Training mode: lora | "
-        f"{trainable_parameter_count:,} / {total_parameter_count:,} "
-        "parameters trainable"
-    )
+    model, tokenizer = load_model_and_tokenizer(args)
 
     print("Loading GSM8K dataset ...")
     if args.debug:
@@ -308,12 +280,12 @@ def main():
         batch_size=args.batch_size,
     )
 
-    optimizer = optim.AdamW(
-        learning_rate=args.lr,
-        weight_decay=0.01,
-        bias_correction=True,
-    )
-    loss_and_grad = nn.value_and_grad(model, sft_loss)
+    trainable_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr)
     writer = SummaryWriter(log_dir=args.tensorboard_dir)
     print(f"TensorBoard logs: tensorboard --logdir={args.tensorboard_dir}")
 
@@ -338,31 +310,40 @@ def main():
 
             step = completed_steps + 1
             step_start_time = time.time()
-            input_ids = to_mlx_batch(input_ids, mx.int32)  # [B, L]
-            loss_mask = to_mlx_batch(loss_mask, mx.float32)  # [B, L]
+            input_ids = input_ids.to("cuda")  # [B, L]
+            loss_mask = loss_mask.to("cuda")  # [B, L]
 
-            (loss, response_token_count), gradients = loss_and_grad(
-                model,
-                input_ids,
-                loss_mask,
-            )
-            gradients, gradient_norm = optim.clip_grad_norm(
-                gradients,
+            optimizer.zero_grad(set_to_none=True)
+
+            logits = model(input_ids).logits  # [B, L, V]
+
+            logits_shifted = logits[:, :-1, :]  # [B, L-1, V]
+            targets = input_ids[:, 1:]  # [B, L-1]
+            loss_mask_shifted = loss_mask[:, 1:]  # [B, L-1]
+
+            ce = F.cross_entropy(
+                logits_shifted.transpose(1, 2),
+                targets,
+                reduction="none",
+            )  # [B, L-1]
+
+            masked_ce = ce * loss_mask_shifted  # [B, L-1]
+            response_token_count = loss_mask_shifted.sum()
+            loss = masked_ce.sum() / response_token_count
+
+            loss.backward()
+
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_parameters,
                 max_norm=1.0,
             )
-            optimizer.update(model, gradients)
-            mx.eval(
-                model.parameters(),
-                optimizer.state,
-                loss,
-                gradient_norm,
-                response_token_count,
-            )
 
-            loss_value = loss.item()
-            gradient_norm_value = gradient_norm.item()
-            response_token_count_value = int(response_token_count.item())
-            tokens_per_second = response_token_count_value / max(
+            optimizer.step()
+
+            loss_value = loss.detach().float().item()
+            gradient_norm_value = gradient_norm.detach().float().item()
+            response_token_count = int(response_token_count.detach().item())
+            tokens_per_second = response_token_count / max(
                 time.time() - step_start_time,
                 1e-8,
             )
@@ -371,11 +352,7 @@ def main():
             writer.add_scalar("train/loss", loss_value, step)
             writer.add_scalar("train/grad_norm", gradient_norm_value, step)
             writer.add_scalar("train/learning_rate", args.lr, step)
-            writer.add_scalar(
-                "train/response_tokens",
-                response_token_count_value,
-                step,
-            )
+            writer.add_scalar("train/response_tokens", response_token_count, step)
             writer.add_scalar("train/tokens_per_sec", tokens_per_second, step)
 
             progress.set_description(f"train loss={loss_value:.4f}")
@@ -390,7 +367,7 @@ def main():
 
             if args.save_every > 0 and step % args.save_every == 0:
                 writer.flush()
-                save_checkpoint(model, args.checkpoint_dir, step, args)
+                save_checkpoint(model, tokenizer, args.checkpoint_dir, step)
 
     progress.close()
 
@@ -400,7 +377,7 @@ def main():
         and completed_steps % args.save_every != 0
     ):
         writer.flush()
-        save_checkpoint(model, args.checkpoint_dir, completed_steps, args)
+        save_checkpoint(model, tokenizer, args.checkpoint_dir, completed_steps)
 
     writer.close()
     sys.stdout.flush()

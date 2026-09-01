@@ -246,8 +246,15 @@ def main():
     args = parse_args()
     saved_args = vars(args).copy()
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
-    args.tensorboard_dir = f"{os.path.normpath(args.tensorboard_dir)}_{timestamp}"
-    args.checkpoint_dir = f"{os.path.normpath(args.checkpoint_dir)}_{timestamp}"
+    run_name = f"grpo_{timestamp}"
+    args.tensorboard_dir = os.path.join(
+        os.path.normpath(args.tensorboard_dir),
+        run_name,
+    )
+    args.checkpoint_dir = os.path.join(
+        os.path.normpath(args.checkpoint_dir),
+        run_name,
+    )
     os.makedirs(args.tensorboard_dir)
     os.makedirs(args.checkpoint_dir)
 

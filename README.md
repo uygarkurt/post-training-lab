@@ -20,13 +20,13 @@ Apple M4 chip.
 | Backend | Hardware | Status | Documentation |
 | ------- | -------- | ------ | ------------- |
 | MLX | Apple Silicon | Supported | [MLX backend](mlx_backend/README.md) |
-| PyTorch (CUDA) | NVIDIA GPU | In progress | [PyTorch (CUDA) backend](cuda_backend/README.md) |
+| PyTorch (CUDA) | NVIDIA GPU | Supported | [PyTorch (CUDA) backend](cuda_backend/README.md) |
 
 ## Supported algorithms
 
 | Algorithm | MLX (Apple Silicon) | PyTorch (CUDA) |
 | --------- | ------------------- | -------------- |
-| SFT | ✅ | ❌ |
+| SFT | ✅ | ✅ |
 | GRPO | ✅ | ✅ |
 
 ## Tutorials
@@ -58,6 +58,7 @@ post-training-lab/
 │   ├── generate_text.py
 │   └── gsm8k_eval.py
 ├── cuda_backend/            # Runnable PyTorch implementation
+│   ├── sft_train.py         # Supervised fine-tuning with LoRA or full training
 │   ├── grpo_train.py
 │   ├── generate_text.py
 │   └── gsm8k_eval.py
@@ -70,8 +71,9 @@ post-training-lab/
 └── runs/                    # Backend-qualified TensorBoard logs (gitignored)
 ```
 
-PyTorch/CUDA GRPO runs use `runs/cuda/grpo_<timestamp>/` with matching
-checkpoints in `checkpoints/cuda/grpo_<timestamp>/`.
+Training runs use `runs/<backend>/<algorithm>/<algorithm>_<timestamp>/` with
+matching checkpoints in
+`checkpoints/<backend>/<algorithm>/<algorithm>_<timestamp>/`.
 
 Generate text or evaluate a PyTorch/CUDA checkpoint on the GSM8K test split:
 

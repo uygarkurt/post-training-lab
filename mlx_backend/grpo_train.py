@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 
 import numpy as np
 from mlx_lm import load, generate
@@ -63,10 +64,10 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=10, help="Log tokens/sec to TensorBoard every N steps")
     parser.add_argument("--param-log-every", type=int, default=50, help="Log LoRA parameter histograms every N steps")
 
-    parser.add_argument("--tensorboard-dir", type=str, default="./runs/mlx/grpo", help="Directory for TensorBoard logs")
+    parser.add_argument("--tensorboard-dir", type=str, default="./runs/mlx/grpo", help="Base path for timestamped TensorBoard run directories")
 
     parser.add_argument("--save-every", type=int, default=100, help="Save adapter checkpoint every N steps (0 to disable)")
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/mlx/grpo", help="Directory for checkpoints")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/mlx/grpo", help="Base path for timestamped checkpoint directories")
 
     args = parser.parse_args()
     return args
@@ -215,6 +216,16 @@ def save_full_checkpoint(model, step, args):
 
 def main():
     args = parse_args()
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
+    run_name = f"grpo_{timestamp}"
+    args.tensorboard_dir = os.path.join(
+        os.path.normpath(args.tensorboard_dir),
+        run_name,
+    )
+    args.checkpoint_dir = os.path.join(
+        os.path.normpath(args.checkpoint_dir),
+        run_name,
+    )
 
     # ---- Load model --------------------------------------------------------
     if args.load_adapter:
