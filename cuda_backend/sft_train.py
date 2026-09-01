@@ -54,7 +54,7 @@ def parse_args():
         default=512,
         help="Maximum tokenized sample length",
     )
-    parser.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate")
+    parser.add_argument("--lr", type=float, default=5e-5, help="AdamW learning rate")
     parser.add_argument("--num-iters", type=int, default=500, help="Number of optimizer steps")
 
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank (r)")
@@ -271,6 +271,8 @@ def main():
         train_dataset,
         tokenizer,
         batch_size=args.batch_size,
+        shuffle=True,
+        seed=args.seed,
     )
     val_loader = gsm8k.build_sft_dataloader(
         val_dataset,

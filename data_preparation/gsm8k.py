@@ -1,5 +1,5 @@
 """
-Shared preparation for openai/gsm8k (socratic split).
+Shared preparation for openai/gsm8k (main split).
 
 This module owns tokenization, dataset splitting, PyTorch Dataset/DataLoader
 construction, padding, and batching. Backend entrypoints are responsible for
@@ -36,7 +36,7 @@ from datasets import load_dataset as hf_load_dataset
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 DATASET_NAME = "openai/gsm8k"
-DATASET_SUBSET = "socratic"
+DATASET_SUBSET = "main"
 DATASET_SPLIT = "train"
 
 _ANSWER_RE = re.compile(r"####\s*([-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)")
@@ -75,12 +75,23 @@ def _make_sft_collate_fn(tokenizer):
     return collate_fn
 
 
-def build_sft_dataloader(dataset, tokenizer, batch_size):
-    """Build a deterministic DataLoader of padded SFT examples."""
+def build_sft_dataloader(
+    dataset,
+    tokenizer,
+    batch_size,
+    shuffle=False,
+    seed=0,
+):
+    """Build a deterministic, optionally shuffled SFT DataLoader."""
+    generator = None
+    if shuffle:
+        generator = torch.Generator().manual_seed(seed)
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=shuffle,
+        generator=generator,
         collate_fn=_make_sft_collate_fn(tokenizer),
         num_workers=0,
         drop_last=False,
