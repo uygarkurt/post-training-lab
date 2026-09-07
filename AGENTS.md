@@ -6,6 +6,19 @@ This repository is a minimal, hackable implementation of the full LLM
 post-training pipeline. It is primarily an educational and experimentation
 codebase.
 
+## Local research context
+
+- Before handling each user request, read all Markdown files under
+  `.agents/local/` if that directory exists.
+- Treat these files as private, mutable context for the current research and
+  experiments, in addition to the guidance in this file.
+- Re-read them for each request because the experimental plan may change
+  during a session.
+- Distinguish established research goals from provisional parameters and
+  assumptions as marked in those files.
+- Do not modify files under `.agents/local/` unless the user asks.
+- If the directory is absent or empty, continue without mentioning it.
+
 ## Design priorities
 
 When making changes, prioritize:
@@ -60,18 +73,20 @@ multiple abstraction layers.
 - Keep MLX tensor conversion, devices, model operations, losses, and
   optimization in `mlx_backend/`; keep their CUDA equivalents in
   `cuda_backend/`.
-- Implement new algorithms and major algorithm changes in CUDA first, then
-  mirror them in MLX without changing the shared data contract.
+- Implement new algorithms and major algorithm changes in CUDA first.
+- Mirror changes to MLX only when explicitly requested by the user. Changes
+  to CUDA do not require corresponding MLX edits. When mirroring, preserve
+  the shared data contract.
 - Treat established variable names in `cuda_backend/` as canonical for shared
   LLM-training concepts. Before introducing a variable, search the existing
   CUDA implementations for the same value and reuse its name when the
-  semantics match; carry that name into corresponding MLX implementations.
+  semantics match; carry that name into MLX when mirroring is requested.
   Introduce a different name only when the value has genuinely different
   semantics, and keep that difference explicit.
-- Keep corresponding backend filenames, CLI options, section order, variable
-  names, and mathematical steps aligned where practical.
-- Prefer structural parity over literal line-for-line identity. Use native
-  PyTorch and MLX operations when that makes each implementation clearer.
+- When mirroring is requested, keep corresponding backend filenames, CLI
+  options, section order, variable names, and mathematical steps aligned where
+  practical. Prefer structural parity over literal line-for-line identity,
+  using native PyTorch and MLX operations where they are clearer.
 - Do not change shared data code solely to accommodate one backend.
 
 ## CUDA training script consistency

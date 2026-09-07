@@ -38,10 +38,46 @@ uv run --extra cuda -m cuda_backend.gsm8k_eval \
   --load-adapter
 ```
 
-SFT uses a constant `5e-5` learning rate by default. Its LoRA configuration
-uses rank 8, alpha 16, zero dropout, and all linear layers. Training examples
-are shuffled deterministically, while validation reports response-token loss
-before training and every 50 steps by default.
+SFT uses 200 steps of warmup to `5e-5`, followed by cosine decay to `5e-6` by
+default. Its LoRA configuration uses rank 8, alpha 16, zero dropout, and all
+linear layers. Training examples are shuffled deterministically, while
+validation reports response-token loss before training and every 50 steps
+by default.
+
+### SFT learning-rate schedule
+
+SFT always uses Hugging Face's
+[`get_cosine_with_min_lr_schedule_with_warmup`](https://huggingface.co/docs/transformers/main_classes/optimizer_schedules#transformers.get_cosine_with_min_lr_schedule_with_warmup).
+The scheduler advances after every optimizer update, independently of
+`--log-every`. No scheduler-selection argument is needed.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `--lr` | `5e-5` | Peak learning rate |
+| `--warmup-steps` | `200` | Linear warmup to the peak; zero disables warmup |
+| `--min-lr` | `5e-6` | Minimum rate at the end of cosine decay |
+| `--num-iters` | `500` | Total optimizer steps, including warmup; decay ends here |
+
+For example, add these options to an SFT command:
+
+```bash
+--num-iters 50000
+```
+
+With warmup enabled, Hugging Face initializes the learning rate at zero.
+After 200 optimizer updates, the scheduler sets `5e-5` for the next update;
+after 50,000 updates it reaches `5e-6`. Without warmup, the first update uses
+`--lr`. These are illustrative settings, not measured optimal values.
+Stopping early leaves the decay unfinished. For short runs, set
+`--warmup-steps` below `--num-iters` (use zero for a one-step smoke test).
+
+TensorBoard's `train/learning_rate` and each SFT checkpoint's `metadata.json`
+record the rate used for that step's optimizer update, before the scheduler
+advances. The final recorded rate can therefore be slightly above `--min-lr`.
+Checkpoint metadata contains only `step`, `elapsed_hours`, and `learning_rate`;
+the run's `args.json` records the training arguments. Loading an adapter starts
+a new optimizer and schedule; metadata does not provide full training-state
+resumption.
 
 ## Fast SFT smoke test
 
@@ -52,6 +88,7 @@ uv run --extra cuda -m cuda_backend.sft_train \
   --debug \
   --debug-samples 2 \
   --num-iters 1 \
+  --warmup-steps 0 \
   --eval-every -1 \
   --save-every 0
 ```

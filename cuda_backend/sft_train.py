@@ -14,6 +14,7 @@ from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup
 
 from data_preparation import gsm8k, numinamath
 
@@ -60,8 +61,10 @@ def parse_args():
         default=512,
         help="Maximum tokenized sample length",
     )
-    parser.add_argument("--lr", type=float, default=5e-5, help="AdamW learning rate")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Peak AdamW learning rate for cosine scheduling")
     parser.add_argument("--num-iters", type=int, default=500, help="Number of optimizer steps")
+    parser.add_argument("--warmup-steps", type=int, default=200, help="Steps to linearly increase the learning rate to --lr (0 disables warmup)")
+    parser.add_argument("--min-lr", type=float, default=5e-6, help="Minimum learning rate at the end of the cosine schedule")
 
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank (r)")
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha (scale = alpha / rank)")
@@ -77,20 +80,15 @@ def parse_args():
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/cuda/sft", help="Base path for timestamped checkpoint directories")
 
     args = parser.parse_args()
-    if args.batch_size < 1:
-        parser.error("--batch-size must be at least 1")
-    if args.debug_samples < 1:
-        parser.error("--debug-samples must be at least 1")
+    # The scheduler accepts some combinations that silently change its behavior.
     if args.num_iters < 1:
         parser.error("--num-iters must be at least 1")
-    if args.max_seq_len < 2:
-        parser.error("--max-seq-len must be at least 2")
-    if not 0.0 < args.val_split < 1.0:
-        parser.error("--val-split must be between 0 and 1")
-    if args.lora_rank < 1:
-        parser.error("--lora-rank must be at least 1")
-    if args.log_every < 1:
-        parser.error("--log-every must be at least 1")
+    if not 0 <= args.warmup_steps < args.num_iters:
+        parser.error("--warmup-steps must be at least 0 and less than --num-iters")
+    if not np.isfinite(args.lr) or args.lr <= 0:
+        parser.error("--lr must be finite and greater than 0")
+    if not 0 <= args.min_lr <= args.lr:
+        parser.error("--min-lr must be between 0 and --lr")
     return args
 
 
@@ -237,14 +235,17 @@ def calculate_validation_loss(model, val_loader):
     return total_loss / total_response_token_count
 
 
-def save_checkpoint(model, tokenizer, checkpoint_dir, step, training_start_time):
-    """Save model, tokenizer, and elapsed hours, including eval and saves."""
+def save_checkpoint(
+    model, tokenizer, checkpoint_dir, step, training_start_time, learning_rate,
+):
+    """Save weights, tokenizer, elapsed hours, and the last update's learning rate."""
     checkpoint_path = os.path.join(checkpoint_dir, f"step_{step:06d}")
     model.save_pretrained(checkpoint_path)
     tokenizer.save_pretrained(checkpoint_path)
     metadata = {
         "step": step,
         "elapsed_hours": (time.monotonic() - training_start_time) / 3600,
+        "learning_rate": learning_rate,
     }
     with open(os.path.join(checkpoint_path, "metadata.json"), "w") as metadata_file:
         json.dump(metadata, metadata_file, indent=2)
@@ -310,6 +311,12 @@ def main():
         if parameter.requires_grad
     ]
     optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr)
+    scheduler = get_cosine_with_min_lr_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=args.num_iters,
+        min_lr=args.min_lr,
+    )
     writer = SummaryWriter(log_dir=args.tensorboard_dir)
     print(f"TensorBoard logs: tensorboard --logdir={args.tensorboard_dir}")
 
@@ -369,7 +376,10 @@ def main():
                 max_norm=1.0,
             )
 
+            # Record the rate used for this update before advancing the schedule.
+            learning_rate = optimizer.param_groups[0]["lr"]
             optimizer.step()
+            scheduler.step()
 
             loss_value = loss.detach().float().item()
             gradient_norm_value = gradient_norm.detach().float().item()
@@ -391,7 +401,7 @@ def main():
                     step,
                 )
                 writer.add_scalar("train/grad_norm", gradient_norm_value, step)
-                writer.add_scalar("train/learning_rate", args.lr, step)
+                writer.add_scalar("train/learning_rate", learning_rate, step)
                 writer.add_scalar("train/response_tokens", response_token_count, step)
                 writer.add_scalar("train/tokens_per_sec", tokens_per_second, step)
                 writer.add_scalar("train/epoch", dataset_passes, step)
@@ -423,6 +433,7 @@ def main():
                 writer.flush()
                 save_checkpoint(
                     model, tokenizer, args.checkpoint_dir, step, training_start_time,
+                    learning_rate,
                 )
 
     progress.close()
@@ -435,6 +446,7 @@ def main():
         writer.flush()
         save_checkpoint(
             model, tokenizer, args.checkpoint_dir, completed_steps, training_start_time,
+            learning_rate,
         )
 
     writer.close()

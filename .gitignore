@@ -6,6 +6,7 @@ checkpoints/
 scripts/
 .claude/
 .cursor/
+.agents/local/
 .venv/
 final_models/
 notes.txt
