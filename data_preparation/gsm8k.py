@@ -101,7 +101,7 @@ def build_sft_dataloader(
 class GSM8KSFTDataset(Dataset):
     """Tokenize and hold GSM8K prompt-answer examples for SFT."""
 
-    def __init__(self, tokenizer, max_seq_len, max_prompt_len=None, split=DATASET_SPLIT):
+    def __init__(self, tokenizer, max_seq_len, split=DATASET_SPLIT):
         self.samples = []
         self.skipped = 0
 
@@ -126,16 +126,15 @@ class GSM8KSFTDataset(Dataset):
             prompt_ids = tokenizer.encode(prompt_text)
             full_ids = tokenizer.encode(full_text)
 
-            if max_prompt_len is not None and len(prompt_ids) >= max_prompt_len:
-                self.skipped += 1
-                continue
-
             if len(full_ids) < 4 or len(prompt_ids) >= len(full_ids):
                 self.skipped += 1
                 continue
 
-            full_ids = full_ids[:max_seq_len]
-            prompt_len = min(len(prompt_ids), len(full_ids))
+            if len(full_ids) > max_seq_len:
+                self.skipped += 1
+                continue
+
+            prompt_len = len(prompt_ids)
             loss_mask = [0] * prompt_len + [1] * (len(full_ids) - prompt_len)
 
             if sum(loss_mask) == 0:
@@ -162,13 +161,11 @@ class GSM8KSFTDataset(Dataset):
         max_seq_len,
         val_split,
         seed,
-        max_prompt_len=None,
     ):
         """Build SFT train and validation datasets."""
         dataset = cls(
             tokenizer,
             max_seq_len=max_seq_len,
-            max_prompt_len=max_prompt_len,
         )
 
         n_val = max(1, int(len(dataset) * val_split))
@@ -193,13 +190,11 @@ class GSM8KSFTDataset(Dataset):
         max_seq_len,
         seed,
         debug_samples,
-        max_prompt_len=None,
     ):
         """Build matching tiny train and validation datasets."""
         dataset = cls(
             tokenizer,
             max_seq_len=max_seq_len,
-            max_prompt_len=max_prompt_len,
         )
 
         shuffled_indices = torch.randperm(

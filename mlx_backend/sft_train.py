@@ -60,7 +60,6 @@ def parse_args():
 
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization and data shuffling")
     parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from GSM8K train set")
-    parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
     parser.add_argument("--eval-every", type=int, default=50, help="Validate every N steps after the initial validation (-1 to disable)")
 
     parser.add_argument("--tensorboard-dir", type=str, default="./runs/mlx/sft", help="Base path for timestamped TensorBoard run directories")
@@ -77,8 +76,6 @@ def parse_args():
         parser.error("--num-iters must be at least 1")
     if args.max_seq_len < 2:
         parser.error("--max-seq-len must be at least 2")
-    if args.max_prompt_len < 1:
-        parser.error("--max-prompt-len must be at least 1")
     if not 0.0 < args.val_split < 1.0:
         parser.error("--val-split must be between 0 and 1")
     if args.lora_rank < 1:
@@ -280,7 +277,6 @@ def main():
             gsm8k.GSM8KSFTDataset.build_debug_overfit_datasets(
                 tokenizer,
                 max_seq_len=args.max_seq_len,
-                max_prompt_len=args.max_prompt_len,
                 seed=args.seed,
                 debug_samples=args.debug_samples,
             )
@@ -290,7 +286,6 @@ def main():
             gsm8k.GSM8KSFTDataset.build_train_val_datasets(
                 tokenizer,
                 max_seq_len=args.max_seq_len,
-                max_prompt_len=args.max_prompt_len,
                 val_split=args.val_split,
                 seed=args.seed,
             )

@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from data_preparation import gsm8k
+from data_preparation import gsm8k, numinamath
 
 
 def parse_args():
@@ -27,15 +27,21 @@ def parse_args():
 
     parser.add_argument(
         "--debug", action="store_true",
-        help="Overfit a tiny GSM8K subset (same samples for train and val)",
+        help="Overfit a tiny subset (same samples for train and val)",
     )
     parser.add_argument(
         "--debug-samples", type=int, default=8,
-        help="Number of GSM8K samples in --debug mode (train and val use the same set)",
+        help="Number of samples in --debug mode (train and val use the same set)",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=("numinamath-algebra", "gsm8k"),
+        default="numinamath-algebra",
+        help="SFT dataset to train on",
     )
     parser.add_argument(
         "--model", type=str,
-        default="Qwen/Qwen2-0.5B-Instruct",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
         help="Hugging Face base model, merged model, or local model directory",
     )
     parser.add_argument(
@@ -61,8 +67,8 @@ def parse_args():
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha (scale = alpha / rank)")
 
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization and data shuffling")
-    parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from GSM8K train set")
-    parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
+    parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from the training dataset")
+    parser.add_argument("--log-every", type=int, default=10, help="Write training metrics to TensorBoard every N steps (loss averaged over response tokens)")
     parser.add_argument("--eval-every", type=int, default=50, help="Validate every N steps after the initial validation (-1 to disable)")
 
     parser.add_argument("--tensorboard-dir", type=str, default="./runs/cuda/sft", help="Base path for timestamped TensorBoard run directories")
@@ -79,12 +85,12 @@ def parse_args():
         parser.error("--num-iters must be at least 1")
     if args.max_seq_len < 2:
         parser.error("--max-seq-len must be at least 2")
-    if args.max_prompt_len < 1:
-        parser.error("--max-prompt-len must be at least 1")
     if not 0.0 < args.val_split < 1.0:
         parser.error("--val-split must be between 0 and 1")
     if args.lora_rank < 1:
         parser.error("--lora-rank must be at least 1")
+    if args.log_every < 1:
+        parser.error("--log-every must be at least 1")
     return args
 
 
@@ -159,6 +165,35 @@ def load_model_and_tokenizer(args):
     return model, tokenizer
 
 
+def load_sft_datasets(tokenizer, args):
+    """Load the selected SFT datasets and return their matching collator builder."""
+    if args.dataset == "numinamath-algebra":
+        print("Loading NuminaMath Algebra dataset ...")
+        dataset_class = numinamath.NuminaMathSFTDataset
+        build_dataloader = numinamath.build_sft_dataloader
+    else:
+        print("Loading GSM8K dataset ...")
+        dataset_class = gsm8k.GSM8KSFTDataset
+        build_dataloader = gsm8k.build_sft_dataloader
+
+    if args.debug:
+        train_dataset, val_dataset = dataset_class.build_debug_overfit_datasets(
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            seed=args.seed,
+            debug_samples=args.debug_samples,
+        )
+    else:
+        train_dataset, val_dataset = dataset_class.build_train_val_datasets(
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            val_split=args.val_split,
+            seed=args.seed,
+        )
+
+    return train_dataset, val_dataset, build_dataloader
+
+
 @torch.inference_mode()
 def calculate_validation_loss(model, val_loader):
     """Return response-token-weighted loss over the validation loader."""
@@ -202,11 +237,17 @@ def calculate_validation_loss(model, val_loader):
     return total_loss / total_response_token_count
 
 
-def save_checkpoint(model, tokenizer, checkpoint_dir, step):
-    """Save a full model or PEFT adapter and tokenizer for one step."""
+def save_checkpoint(model, tokenizer, checkpoint_dir, step, training_start_time):
+    """Save model, tokenizer, and elapsed hours, including eval and saves."""
     checkpoint_path = os.path.join(checkpoint_dir, f"step_{step:06d}")
     model.save_pretrained(checkpoint_path)
     tokenizer.save_pretrained(checkpoint_path)
+    metadata = {
+        "step": step,
+        "elapsed_hours": (time.monotonic() - training_start_time) / 3600,
+    }
+    with open(os.path.join(checkpoint_path, "metadata.json"), "w") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
     print(f"  [ckpt] step {step:5d} -> {checkpoint_path}")
 
 
@@ -246,35 +287,18 @@ def main():
     set_random_seed(args.seed)
     model, tokenizer = load_model_and_tokenizer(args)
 
-    print("Loading GSM8K dataset ...")
-    if args.debug:
-        train_dataset, val_dataset = (
-            gsm8k.GSM8KSFTDataset.build_debug_overfit_datasets(
-                tokenizer,
-                max_seq_len=args.max_seq_len,
-                max_prompt_len=args.max_prompt_len,
-                seed=args.seed,
-                debug_samples=args.debug_samples,
-            )
-        )
-    else:
-        train_dataset, val_dataset = (
-            gsm8k.GSM8KSFTDataset.build_train_val_datasets(
-                tokenizer,
-                max_seq_len=args.max_seq_len,
-                max_prompt_len=args.max_prompt_len,
-                val_split=args.val_split,
-                seed=args.seed,
-            )
-        )
-    train_loader = gsm8k.build_sft_dataloader(
+    train_dataset, val_dataset, build_dataloader = load_sft_datasets(
+        tokenizer,
+        args,
+    )
+    train_loader = build_dataloader(
         train_dataset,
         tokenizer,
         batch_size=args.batch_size,
         shuffle=True,
         seed=args.seed,
     )
-    val_loader = gsm8k.build_sft_dataloader(
+    val_loader = build_dataloader(
         val_dataset,
         tokenizer,
         batch_size=args.batch_size,
@@ -295,16 +319,23 @@ def main():
         print(f"  [val] step {0:5d} | loss {validation_loss:.4f}")
 
     model.train()
+    batches_per_epoch = len(train_loader)
     progress = tqdm(
         total=args.num_iters,
-        desc="train loss=----",
+        desc=f"epoch=1 batch=0/{batches_per_epoch} loss=----",
         unit="step",
         ncols=terminal_columns,
     )
     completed_steps = 0
+    epoch_number = 0
+    examples_seen = 0
+    loss_sum_since_log = 0.0
+    response_tokens_since_log = 0
+    training_start_time = time.monotonic()
 
     while completed_steps < args.num_iters:
-        for input_ids, loss_mask in train_loader:
+        epoch_number += 1
+        for batch_index, (input_ids, loss_mask) in enumerate(train_loader, start=1):
             if completed_steps >= args.num_iters:
                 break
 
@@ -348,15 +379,38 @@ def main():
                 1e-8,
             )
             completed_steps = step
+            examples_seen += input_ids.shape[0]
+            dataset_passes = examples_seen / len(train_dataset)
 
-            writer.add_scalar("train/loss", loss_value, step)
-            writer.add_scalar("train/grad_norm", gradient_norm_value, step)
-            writer.add_scalar("train/learning_rate", args.lr, step)
-            writer.add_scalar("train/response_tokens", response_token_count, step)
-            writer.add_scalar("train/tokens_per_sec", tokens_per_second, step)
+            loss_sum_since_log += loss_value * response_token_count
+            response_tokens_since_log += response_token_count
+            if step % args.log_every == 0 or step == args.num_iters:
+                writer.add_scalar(
+                    "train/loss",
+                    loss_sum_since_log / response_tokens_since_log,
+                    step,
+                )
+                writer.add_scalar("train/grad_norm", gradient_norm_value, step)
+                writer.add_scalar("train/learning_rate", args.lr, step)
+                writer.add_scalar("train/response_tokens", response_token_count, step)
+                writer.add_scalar("train/tokens_per_sec", tokens_per_second, step)
+                writer.add_scalar("train/epoch", dataset_passes, step)
+                writer.add_scalar("train/examples_seen", examples_seen, step)
+                loss_sum_since_log = 0.0
+                response_tokens_since_log = 0
 
-            progress.set_description(f"train loss={loss_value:.4f}")
+            progress.set_description(
+                f"epoch={epoch_number} batch={batch_index}/{batches_per_epoch} "
+                f"loss={loss_value:.4f}",
+                refresh=False,
+            )
             progress.update(1)
+
+            if examples_seen % len(train_dataset) == 0:
+                progress.write(
+                    f"  [data] completed dataset pass {int(dataset_passes)} | "
+                    f"step {step:5d}"
+                )
 
             if args.eval_every > 0 and step % args.eval_every == 0:
                 validation_loss = calculate_validation_loss(model, val_loader)
@@ -367,7 +421,9 @@ def main():
 
             if args.save_every > 0 and step % args.save_every == 0:
                 writer.flush()
-                save_checkpoint(model, tokenizer, args.checkpoint_dir, step)
+                save_checkpoint(
+                    model, tokenizer, args.checkpoint_dir, step, training_start_time,
+                )
 
     progress.close()
 
@@ -377,7 +433,9 @@ def main():
         and completed_steps % args.save_every != 0
     ):
         writer.flush()
-        save_checkpoint(model, tokenizer, args.checkpoint_dir, completed_steps)
+        save_checkpoint(
+            model, tokenizer, args.checkpoint_dir, completed_steps, training_start_time,
+        )
 
     writer.close()
     sys.stdout.flush()
