@@ -34,19 +34,36 @@ multiple abstraction layers.
 
 ## Implementation rules
 
-- Preserve the self-contained nature of the training scripts.
-- Prefer explicit code over framework-like abstractions.
+- Keep training scripts self-contained in their algorithm flow; use library
+  utilities directly for supporting functionality.
+- Implement core post-training logic in the training scripts, including
+  losses, rewards, advantages, and algorithm-specific update steps. Prefer
+  explicit code over frameworks that hide this logic.
+- For all supporting functionality, use an existing implementation when it
+  meets the requirements. This applies throughout the project, including
+  dataset loading and processing, tokenization, splitting, padding, batching,
+  optimizers, learning-rate schedules, logging, and serialization.
+- Before writing a helper, check the repository, standard library, and
+  relevant libraries for an implementation to reuse. Prefer direct calls to
+  existing APIs and minimal glue code; do not reimplement available behavior
+  or add wrappers that merely forward calls.
+- Write custom supporting code only when existing implementations cannot meet
+  the requirements. Keep it limited to the missing behavior and briefly
+  explain the concrete limitation that requires it.
 - Avoid introducing classes, registries, factories, configuration frameworks,
   or extra modules unless they remove substantial unavoidable complexity.
 - Do not deduplicate code when doing so would make an individual algorithm
   harder to understand in isolation.
-- Keep the mathematical and algorithmic steps of every post-training method
-  visible in its training script.
+- Keep the core mathematical and algorithmic steps of every post-training
+  method visible in its training script, using existing tensor operations and
+  primitives.
 - Use descriptive variable names, especially for losses, rewards, advantages,
   masks, token probabilities, and other algorithm-specific quantities.
 - Do not add Python type annotations to function or method signatures.
 - Give every new function and class a concise docstring describing its purpose.
-- Keep new dependencies to a minimum.
+- Prefer existing dependencies. Add a focused dependency when it avoids
+  substantial custom supporting code; minimizing dependencies is not a reason
+  to reimplement suitable library functionality.
 - Make the smallest change that satisfies the request.
 - Preserve hackability: changing an algorithm, loss, reward, dataset, or model
   backend should remain straightforward.

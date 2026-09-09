@@ -327,9 +327,13 @@ def main():
 
     model.train()
     batches_per_epoch = len(train_loader)
+    learning_rate_display = f"{optimizer.param_groups[0]['lr']:.3g}".replace("e-0", "e-")
     progress = tqdm(
         total=args.num_iters,
-        desc=f"epoch=1 batch=0/{batches_per_epoch} loss=----",
+        desc=(
+            f"epoch=1 batch=0/{batches_per_epoch} loss=---- "
+            f"lr={learning_rate_display}"
+        ),
         unit="step",
         ncols=terminal_columns,
     )
@@ -409,9 +413,10 @@ def main():
                 loss_sum_since_log = 0.0
                 response_tokens_since_log = 0
 
+            learning_rate_display = f"{learning_rate:.3g}".replace("e-0", "e-")
             progress.set_description(
                 f"epoch={epoch_number} batch={batch_index}/{batches_per_epoch} "
-                f"loss={loss_value:.4f}",
+                f"loss={loss_value:.4f} lr={learning_rate_display}",
                 refresh=False,
             )
             progress.update(1)

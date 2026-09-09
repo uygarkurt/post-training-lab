@@ -17,11 +17,16 @@ build_sft_dataloader(...)
     Return batches of right-padded SFT examples and loss masks.
 """
 
+from pathlib import Path
+
 import torch
 from datasets import load_dataset as hf_load_dataset
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
-DATASET_NAME = "nlile/NuminaMath-1.5-RL-Verifiable"
+DATASET_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "data/numinamath-1.5-rl-verifiable/train.jsonl"
+)
 DATASET_SPLIT = "train"
 PROBLEM_TYPE = "Algebra"
 
@@ -82,7 +87,7 @@ class NuminaMathSFTDataset(Dataset):
         self.skipped_overlong = 0
         self.skipped_invalid = 0
 
-        for row in hf_load_dataset(DATASET_NAME, split=split):
+        for row in hf_load_dataset("json", data_files=str(DATASET_PATH), split=split):
             self.total_rows += 1
             if row["problem_type"] != PROBLEM_TYPE:
                 continue
