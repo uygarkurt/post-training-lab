@@ -63,11 +63,14 @@ post-training-lab/
 │   ├── generate_text.py
 │   ├── gsm8k_eval.py
 │   ├── numinamath_eval.py
-│   └── metamathqa_eval.py
+│   ├── metamathqa_eval.py
+│   └── xlam_function_calling_eval.py
 ├── data_preparation/
 │   ├── gsm8k.py             # Shared samples, DataLoaders, and answer matching
 │   ├── numinamath.py
-│   └── metamathqa.py
+│   ├── metamathqa.py
+│   ├── xlam_function_calling.py
+│   └── sft.py               # SFT padding and batching shared by all datasets
 ├── tutorials/
 │   ├── README.md
 │   └── grpo_minimal_pytorch.py # Self-contained minimal PyTorch GRPO
@@ -106,6 +109,20 @@ Preparation deduplicates exact `query` matches by default and removes
 unparseable reference answers before splitting. Use
 `--keep-duplicate-queries` to retain repeated queries. See the
 [MetaMathQA data README](data/metamathqa/README.md) for split settings and evaluation options.
+
+Prepare xLAM function-calling data and evaluate its local test split:
+
+```bash
+uv run python data/xlam-function-calling-60k/prepare.py
+uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
+  --model_path Qwen/Qwen2.5-0.5B-Instruct \
+  --num-samples 100
+```
+
+The evaluator uses each model's native tool-aware chat template and reports
+exact call-set and function-name-set accuracy. See the
+[xLAM data README](data/xlam-function-calling-60k/README.md) for preparation,
+grading, SFT, and reproducibility details.
 
 ## Citation
 

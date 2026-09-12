@@ -42,7 +42,8 @@ SFT uses 200 steps of warmup to `5e-5`, followed by cosine decay to `5e-6` by
 default. Its LoRA configuration uses rank 8, alpha 16, zero dropout, and all
 linear layers. Training examples are shuffled deterministically, while
 validation reports response-token loss before training and every 50 steps
-by default.
+by default. The default dataset is the prepared xLAM function-calling split,
+with a 2,048-token sequence limit.
 
 ### SFT learning-rate schedule
 
@@ -224,6 +225,26 @@ the extracted `ground_truth` as the reference. If a completion contains
 extraction is used. See the [data README](../data/metamathqa/README.md) for
 split counts, filtering, and answer-matching behavior.
 
+Prepare and evaluate the xLAM function-calling dataset:
+
+```bash
+uv run python data/xlam-function-calling-60k/prepare.py
+uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
+  --model_path Qwen/Qwen2.5-0.5B-Instruct \
+  --num-samples 100 \
+  --output-jsonl xlam_base.jsonl
+```
+
+Preparation converts the source's JSON-encoded tool definitions to standard
+Transformers schemas and creates query-group-disjoint 56,753/2,987 train/test
+splits. Evaluation supplies tools through the tokenizer's native chat template
+and reports strict call-set accuracy, function-name-set accuracy, parse counts,
+and truncations. Parallel-call order and JSON object key order are ignored;
+names, argument values and types, array order, missing calls, and extra calls
+remain significant. See the
+[xLAM data README](../data/xlam-function-calling-60k/README.md) for the complete
+recipe and limitations.
+
 ## Entrypoints
 
 - `sft_train.py` — supervised fine-tuning with LoRA or full-model training
@@ -232,8 +253,11 @@ split counts, filtering, and answer-matching behavior.
 - `gsm8k_eval.py` — greedy GSM8K test-set evaluation
 - `numinamath_eval.py` — greedy batched evaluation on the local NuminaMath Algebra test set
 - `metamathqa_eval.py` — greedy batched evaluation on the local MetaMathQA test set
+- `xlam_function_calling_eval.py` — exact tool-call evaluation on the local xLAM test set
 
 Dataset loading, tokenization, splitting, PyTorch DataLoaders, padding, and
 answer matching come from `data_preparation/gsm8k.py`,
-`data_preparation/numinamath.py`, and `data_preparation/metamathqa.py`. CUDA device placement,
-models, losses, and optimization stay in these backend entrypoints.
+`data_preparation/numinamath.py`, `data_preparation/metamathqa.py`,
+`data_preparation/xlam_function_calling.py`, and the shared SFT batching in
+`data_preparation/sft.py`. CUDA device placement, models, losses, and
+optimization stay in these backend entrypoints.

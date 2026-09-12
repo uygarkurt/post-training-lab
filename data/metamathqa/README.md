@@ -189,5 +189,18 @@ used in the comparison, serialized as a list of strings, just like
 incorrect. Grading compares the parsed reference with the parsed prediction
 once; it does not also compare the raw `answer` separately.
 
-Only evaluation dataset support is implemented here; SFT/GRPO integration is
-left for a later change. Keep `test.jsonl` out of subsequent training.
+## Supervised fine-tuning
+
+MetaMathQA is the default CUDA SFT dataset:
+
+```bash
+uv run --extra cuda -m cuda_backend.sft_train
+```
+
+The SFT loader reads only `train.jsonl`, formats `query` as the user message
+and `response` as the assistant message, and computes loss only over assistant
+tokens. It discards examples longer than `--max-seq-len` and makes the seeded
+runtime train/validation holdout controlled by `--val-split`. The prepared
+`test.jsonl` remains reserved for evaluation and is never loaded for SFT.
+
+GRPO integration is not implemented here.

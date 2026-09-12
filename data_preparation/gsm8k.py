@@ -1,9 +1,9 @@
 """
 Shared preparation for openai/gsm8k (main split).
 
-This module owns tokenization, dataset splitting, PyTorch Dataset/DataLoader
-construction, padding, and batching. Backend entrypoints are responsible for
-converting returned batches to their native tensors and running model code.
+This module owns tokenization, dataset splitting, and GSM8K-specific batching.
+Shared SFT padding and batching come from data_preparation.sft. Backend
+entrypoints remain responsible for model and device operations.
 
 Public API
 ----------
@@ -35,6 +35,8 @@ import torch
 from datasets import load_dataset as hf_load_dataset
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
+from data_preparation.sft import build_sft_dataloader, encode_sft_example
+
 DATASET_NAME = "openai/gsm8k"
 DATASET_SUBSET = "main"
 DATASET_SPLIT = "train"
@@ -53,51 +55,6 @@ _NUMBER_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
 # =============================================================================
 
 
-def _make_sft_collate_fn(tokenizer):
-    """Build a collator that pads samples into PyTorch tensors."""
-    def collate_fn(batch):
-        padded_batch = tokenizer.pad(
-            {
-                "input_ids": [sample["input_ids"] for sample in batch],
-                "attention_mask": [sample["loss_mask"] for sample in batch],
-            },
-            padding=True,
-            padding_side="right",
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
-
-        return (
-            padded_batch["input_ids"],
-            padded_batch["attention_mask"].to(torch.float32),
-        )
-
-    return collate_fn
-
-
-def build_sft_dataloader(
-    dataset,
-    tokenizer,
-    batch_size,
-    shuffle=False,
-    seed=0,
-):
-    """Build a deterministic, optionally shuffled SFT DataLoader."""
-    generator = None
-    if shuffle:
-        generator = torch.Generator().manual_seed(seed)
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        generator=generator,
-        collate_fn=_make_sft_collate_fn(tokenizer),
-        num_workers=0,
-        drop_last=False,
-    )
-
-
 class GSM8KSFTDataset(Dataset):
     """Tokenize and hold GSM8K prompt-answer examples for SFT."""
 
@@ -109,44 +66,16 @@ class GSM8KSFTDataset(Dataset):
             question = row["question"]
             answer = row["answer"]
 
-            prompt_text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": question}],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            full_text = tokenizer.apply_chat_template(
-                [
-                    {"role": "user", "content": question},
-                    {"role": "assistant", "content": answer},
-                ],
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
-            prompt_ids = tokenizer.encode(prompt_text)
-            full_ids = tokenizer.encode(full_text)
-
-            if len(full_ids) < 4 or len(prompt_ids) >= len(full_ids):
+            sample = encode_sft_example(tokenizer, question, answer)
+            if sample is None or len(sample["input_ids"]) < 4:
                 self.skipped += 1
                 continue
 
-            if len(full_ids) > max_seq_len:
+            if len(sample["input_ids"]) > max_seq_len:
                 self.skipped += 1
                 continue
 
-            prompt_len = len(prompt_ids)
-            loss_mask = [0] * prompt_len + [1] * (len(full_ids) - prompt_len)
-
-            if sum(loss_mask) == 0:
-                self.skipped += 1
-                continue
-
-            self.samples.append(
-                {
-                    "input_ids": full_ids,
-                    "loss_mask": loss_mask,
-                }
-            )
+            self.samples.append(sample)
 
     def __len__(self):
         return len(self.samples)

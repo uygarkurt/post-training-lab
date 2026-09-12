@@ -18,4 +18,8 @@ data/*
 data/metamathqa/*
 !data/metamathqa/prepare.py
 !data/metamathqa/README.md
+!data/xlam-function-calling-60k/
+data/xlam-function-calling-60k/*
+!data/xlam-function-calling-60k/prepare.py
+!data/xlam-function-calling-60k/README.md
 constraint_training_experiments_commands.md

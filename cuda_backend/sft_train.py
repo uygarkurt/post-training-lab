@@ -16,7 +16,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup
 
-from data_preparation import gsm8k, numinamath
+from data_preparation import gsm8k, metamathqa, numinamath, xlam_function_calling
 
 
 def parse_args():
@@ -36,8 +36,10 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset",
-        choices=("numinamath-algebra", "gsm8k"),
-        default="numinamath-algebra",
+        choices=(
+            "xlam-function-calling", "metamathqa", "numinamath-algebra", "gsm8k",
+        ),
+        default="xlam-function-calling",
         help="SFT dataset to train on",
     )
     parser.add_argument(
@@ -165,7 +167,15 @@ def load_model_and_tokenizer(args):
 
 def load_sft_datasets(tokenizer, args):
     """Load the selected SFT datasets and return their matching collator builder."""
-    if args.dataset == "numinamath-algebra":
+    if args.dataset == "xlam-function-calling":
+        print("Loading xLAM function-calling dataset ...")
+        dataset_class = xlam_function_calling.XLAMFunctionCallingSFTDataset
+        build_dataloader = xlam_function_calling.build_sft_dataloader
+    elif args.dataset == "metamathqa":
+        print("Loading MetaMathQA dataset ...")
+        dataset_class = metamathqa.MetaMathQASFTDataset
+        build_dataloader = metamathqa.build_sft_dataloader
+    elif args.dataset == "numinamath-algebra":
         print("Loading NuminaMath Algebra dataset ...")
         dataset_class = numinamath.NuminaMathSFTDataset
         build_dataloader = numinamath.build_sft_dataloader

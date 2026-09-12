@@ -1,9 +1,9 @@
 """
 Shared SFT and evaluation preparation for NuminaMath 1.5 Algebra.
 
-This module owns dataset filtering, tokenization, splitting, PyTorch
-Dataset/DataLoader construction, padding, and batching. Backend entrypoints
-remain responsible for model and device operations.
+This module owns dataset filtering, tokenization, splitting, and evaluation
+batching. Shared SFT padding and batching come from data_preparation.sft.
+Backend entrypoints remain responsible for model and device operations.
 
 Public API
 ----------
@@ -32,6 +32,8 @@ import torch
 from datasets import load_dataset as hf_load_dataset
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
+from data_preparation.sft import build_sft_dataloader, encode_sft_example
+
 DATASET_PATH = (
     Path(__file__).resolve().parents[1]
     / "data/numinamath-1.5-rl-verifiable/train.jsonl"
@@ -39,52 +41,6 @@ DATASET_PATH = (
 DATASET_SPLIT = "train"
 TEST_DATASET_PATH = DATASET_PATH.with_name("test.jsonl")
 PROBLEM_TYPE = "Algebra"
-
-
-def _make_sft_collate_fn(tokenizer):
-    """Build a collator that pads samples into PyTorch tensors."""
-    def collate_fn(batch):
-        """Pad one list of tokenized SFT samples."""
-        padded_batch = tokenizer.pad(
-            {
-                "input_ids": [sample["input_ids"] for sample in batch],
-                "attention_mask": [sample["loss_mask"] for sample in batch],
-            },
-            padding=True,
-            padding_side="right",
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
-
-        return (
-            padded_batch["input_ids"],
-            padded_batch["attention_mask"].to(torch.float32),
-        )
-
-    return collate_fn
-
-
-def build_sft_dataloader(
-    dataset,
-    tokenizer,
-    batch_size,
-    shuffle=False,
-    seed=0,
-):
-    """Build a deterministic, optionally shuffled SFT DataLoader."""
-    generator = None
-    if shuffle:
-        generator = torch.Generator().manual_seed(seed)
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        generator=generator,
-        collate_fn=_make_sft_collate_fn(tokenizer),
-        num_workers=0,
-        drop_last=False,
-    )
 
 
 class NuminaMathSFTDataset(Dataset):
@@ -106,40 +62,16 @@ class NuminaMathSFTDataset(Dataset):
             problem = row["problem"]
             solution = row["solution"]
 
-            prompt_text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": problem}],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            full_text = tokenizer.apply_chat_template(
-                [
-                    {"role": "user", "content": problem},
-                    {"role": "assistant", "content": solution},
-                ],
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
-            prompt_ids = tokenizer.encode(prompt_text)
-            full_ids = tokenizer.encode(full_text)
-
-            if len(full_ids) > max_seq_len:
-                self.skipped_overlong += 1
-                continue
-
-            if len(full_ids) < 4 or len(prompt_ids) >= len(full_ids):
+            sample = encode_sft_example(tokenizer, problem, solution)
+            if sample is None or len(sample["input_ids"]) < 4:
                 self.skipped_invalid += 1
                 continue
 
-            loss_mask = [0] * len(prompt_ids) + [1] * (
-                len(full_ids) - len(prompt_ids)
-            )
-            self.samples.append(
-                {
-                    "input_ids": full_ids,
-                    "loss_mask": loss_mask,
-                }
-            )
+            if len(sample["input_ids"]) > max_seq_len:
+                self.skipped_overlong += 1
+                continue
+
+            self.samples.append(sample)
 
     def __len__(self):
         """Return the number of retained Algebra samples."""
