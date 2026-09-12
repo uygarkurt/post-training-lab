@@ -13,5 +13,9 @@ notes.txt
 .DS_Store
 data_preparation/magpie_reasoning.py
 notes.md
-data/
+data/*
+!data/metamathqa/
+data/metamathqa/*
+!data/metamathqa/prepare.py
+!data/metamathqa/README.md
 constraint_training_experiments_commands.md

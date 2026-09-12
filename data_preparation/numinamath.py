@@ -1,5 +1,5 @@
 """
-Shared SFT preparation for the Algebra subset of NuminaMath 1.5.
+Shared SFT and evaluation preparation for NuminaMath 1.5 Algebra.
 
 This module owns dataset filtering, tokenization, splitting, PyTorch
 Dataset/DataLoader construction, padding, and batching. Backend entrypoints
@@ -15,6 +15,15 @@ NuminaMathSFTDataset.build_debug_overfit_datasets(...)
 
 build_sft_dataloader(...)
     Return batches of right-padded SFT examples and loss masks.
+
+NuminaMathEvalDataset(...)
+    Load local test prompts and parsed reference answers for evaluation.
+
+build_eval_dataloader(...)
+    Return batches of left-padded evaluation prompts and attention masks.
+
+is_answer_correct(...)
+    Compare a decoded completion with a parsed reference using Math-Verify.
 """
 
 from pathlib import Path
@@ -28,6 +37,7 @@ DATASET_PATH = (
     / "data/numinamath-1.5-rl-verifiable/train.jsonl"
 )
 DATASET_SPLIT = "train"
+TEST_DATASET_PATH = DATASET_PATH.with_name("test.jsonl")
 PROBLEM_TYPE = "Algebra"
 
 
@@ -197,3 +207,121 @@ class NuminaMathSFTDataset(Dataset):
             "(same set for train and val)"
         )
         return train_dataset, val_dataset
+
+
+# =============================================================================
+# EVALUATION DATASET PREPARATION AND ANSWER MATCHING
+# =============================================================================
+
+
+def is_answer_correct(completion_text, ground_truth):
+    """Compare a completion with a parsed reference by mathematical equivalence."""
+    from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
+
+    if not ground_truth:
+        return False
+
+    predicted_answer = parse(
+        completion_text,
+        extraction_config=[
+            LatexExtractionConfig(boxed_match_priority=0),
+            ExprExtractionConfig(),
+        ],
+        fallback_mode="no_fallback",
+        extraction_mode="first_match",
+    )
+    return bool(predicted_answer) and verify(ground_truth, predicted_answer)
+
+
+def _make_eval_collate_fn(tokenizer):
+    """Build a collator that left-pads prompts and preserves parsed answers."""
+    def collate_fn(batch):
+        """Pad one list of evaluation prompts for batched generation."""
+        padded_prompts = tokenizer.pad(
+            {"input_ids": [sample["prompt_ids"] for sample in batch]},
+            padding=True,
+            padding_side="left",
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+
+        return {
+            "prompt_ids": padded_prompts["input_ids"],
+            "prompt_attention_mask": padded_prompts["attention_mask"],
+            "ground_truth": [sample["ground_truth"] for sample in batch],
+            "question": [sample["question"] for sample in batch],
+            "answer": [sample["answer"] for sample in batch],
+        }
+
+    return collate_fn
+
+
+def build_eval_dataloader(dataset, tokenizer, batch_size):
+    """Build a deterministic DataLoader of padded evaluation prompts."""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=_make_eval_collate_fn(tokenizer),
+        num_workers=0,
+        drop_last=False,
+    )
+
+
+class NuminaMathEvalDataset(Dataset):
+    """Tokenize local NuminaMath test prompts and parse their reference answers."""
+
+    def __init__(self, tokenizer, max_prompt_len, num_samples=None):
+        """Filter test rows, optionally keeping only the first N usable samples."""
+        # Keep the optional evaluation dependency out of SFT-only runs.
+        from math_verify import LatexExtractionConfig, parse
+
+        self.samples = []
+        self.skipped = 0
+        self.unparsed_answers = 0
+
+        for row in hf_load_dataset(
+            "json", data_files={"test": str(TEST_DATASET_PATH)}, split="test"
+        ):
+            problem = row["problem"]
+            prompt_text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": problem}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompt_ids = tokenizer.encode(prompt_text)
+
+            if len(prompt_ids) > max_prompt_len:
+                self.skipped += 1
+                continue
+
+            # The source answer contains bare LaTeX, without math delimiters.
+            ground_truth = parse(
+                f"${row['answer']}$",
+                extraction_config=[LatexExtractionConfig()],
+                fallback_mode="no_fallback",
+            )
+            if not ground_truth:
+                self.unparsed_answers += 1
+                self.skipped += 1
+                continue
+
+            self.samples.append(
+                {
+                    "prompt_ids": prompt_ids,
+                    "ground_truth": ground_truth,
+                    "question": problem,
+                    "answer": row["answer"],
+                }
+            )
+
+        if num_samples is not None:
+            self.samples = self.samples[:num_samples]
+
+    def __len__(self):
+        """Return the number of retained test samples."""
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        """Return one tokenized prompt and its parsed reference answer."""
+        return self.samples[index]

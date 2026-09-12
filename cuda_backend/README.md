@@ -141,13 +141,99 @@ uv run --extra cuda -m cuda_backend.gsm8k_eval \
 
 Omit `--load-adapter` when loading a Hugging Face model or dense checkpoint.
 
+Evaluate a NuminaMath Algebra checkpoint on the local
+`data/numinamath-1.5-rl-verifiable/test.jsonl` file:
+
+```bash
+uv run --extra cuda --extra eval -m cuda_backend.numinamath_eval \
+  --model_path ./checkpoints/cuda/sft/sft_<timestamp>/step_000500 \
+  --load-adapter \
+  --batch-size 8 \
+  --max-prompt-len 512 \
+  --max-new-tokens 512 \
+  --output-jsonl numinamath_sft.jsonl
+```
+
+This follows GSM8K evaluation's model loading, greedy batched generation,
+progress bar, and final accuracy output. The prompt is the same problem-only
+user message used for NuminaMath SFT. Prompts are left-padded; prompts longer
+than `--max-prompt-len` are skipped and reported, never truncated.
+
+The default baseline is `Qwen/Qwen2.5-0.5B-Instruct`, matching CUDA SFT.
+Compare an adapter against the exact base model named in its
+`adapter_config.json`; Qwen2 and Qwen2.5 are different baselines. For example:
+
+```bash
+uv run --extra cuda --extra eval -m cuda_backend.numinamath_eval \
+  --model_path Qwen/Qwen2.5-0.5B-Instruct \
+  --num-samples 1000 \
+  --output-jsonl numinamath_base.jsonl
+```
+
+Evaluation reports how many completions reach `--max-new-tokens` without an
+end-of-sequence token. `--output-jsonl` optionally saves questions, original
+and parsed references, generated completions, correctness, and truncation
+flags for inspection. The output file is overwritten on each invocation.
+
+Add `--num-samples 1000` to evaluate the first 1,000 usable examples in file
+order, after filtering overlong prompts and unparseable references. The local
+test file is already shuffled, so this selects a repeatable subset. Omitting
+the option evaluates all usable examples; requesting more than are available
+uses all of them. Dataset loading and reference parsing still cover the full
+file; the limit reduces model generation. Keep the same sample limit when
+comparing checkpoints.
+
+Answer matching uses [Math-Verify](https://github.com/huggingface/Math-Verify)
+from the existing `eval` extra to compare mathematical expressions against
+the source `answer` field. Boxed answers take priority, with ordinary LaTeX
+and numeric answers also supported. Rows with unparseable reference answers
+are discarded from evaluation and reported in the skipped count. Unparseable
+model outputs count as incorrect. String fallback is disabled for both
+references and model outputs: an extracted string alone is not sufficient.
+Accuracy measures automatic answer agreement over the retained subset;
+parseable but incomplete source answers can still affect the score. Keep generation
+limits fixed when comparing checkpoints. Only the local test file is loaded;
+training and runtime validation continue to use `train.jsonl`.
+
+The source solutions are free-form and do not consistently mark a final answer.
+Grading the first 1,000 usable source solutions with this evaluator and
+Math-Verify 0.9.0 accepts only 485: extraction failures and incomplete or noisy
+reference answers affect even the supplied solutions. Treat this score as
+automatic answer agreement, and inspect saved completions before interpreting
+a change as improved or degraded reasoning. Comparison timeouts count as
+incorrect; they do not stop evaluation.
+
+Evaluate MetaMathQA using the prepared local test file:
+
+```bash
+uv run --extra eval python data/metamathqa/prepare.py
+uv run --extra cuda --extra eval -m cuda_backend.metamathqa_eval \
+  --model_path Qwen/Qwen2.5-0.5B-Instruct \
+  --dataset-path data/metamathqa/test.jsonl \
+  --num-samples 100 \
+  --output-jsonl metamathqa_base.jsonl
+```
+
+Preparation deduplicates exact queries by default; add
+`--keep-duplicate-queries` to retain them. Unparseable references are removed
+before splitting, using Math-Verify from the `eval` extra. MetaMathQA evaluation
+follows the NuminaMath CLI and generation settings, using only `query` as the
+prompt and
+the extracted `ground_truth` as the reference. If a completion contains
+`The answer is:`, its final suffix is graded; otherwise boxed/LaTeX/numeric
+extraction is used. See the [data README](../data/metamathqa/README.md) for
+split counts, filtering, and answer-matching behavior.
+
 ## Entrypoints
 
 - `sft_train.py` — supervised fine-tuning with LoRA or full-model training
 - `grpo_train.py` — group-relative policy optimization with LoRA or full-model training
 - `generate_text.py` — inference from a base model, dense checkpoint, or PEFT adapter
 - `gsm8k_eval.py` — greedy GSM8K test-set evaluation
+- `numinamath_eval.py` — greedy batched evaluation on the local NuminaMath Algebra test set
+- `metamathqa_eval.py` — greedy batched evaluation on the local MetaMathQA test set
 
 Dataset loading, tokenization, splitting, PyTorch DataLoaders, padding, and
-answer matching come from `data_preparation/gsm8k.py`. CUDA device placement,
+answer matching come from `data_preparation/gsm8k.py`,
+`data_preparation/numinamath.py`, and `data_preparation/metamathqa.py`. CUDA device placement,
 models, losses, and optimization stay in these backend entrypoints.
