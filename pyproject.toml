@@ -26,7 +26,18 @@ cuda = [
     "transformers>=5.5.3",
 ]
 eval = [
-    "math-verify[antlr4-13-2]>=0.9.0",
+    "math-verify[antlr4-11-0]>=0.9.0",
+]
+evaluate = [
+    "evalscope[bfcl]==1.11.1",
+    "lm-eval[ifeval,math,vllm]==0.4.13",
+    "soundfile>=0.13.1",
+]
+
+[tool.uv]
+override-dependencies = [
+    { package = { name = "bfcl-eval", version = "2025.10.27.1" }, dependencies = ["numpy>=2.0"] },
+    { package = { name = "evalscope", version = "1.11.1" }, dependencies = ["latex2sympy2-extended[antlr4-11-0]"] },
 ]
 
 [project.urls]
