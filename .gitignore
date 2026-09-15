@@ -3,7 +3,8 @@ mlx-tune/
 nanochat/
 runs/
 checkpoints/
-scripts/
+scripts/*
+!scripts/evaluate_checkpoints.py
 .claude/
 .cursor/
 .agents/local/
