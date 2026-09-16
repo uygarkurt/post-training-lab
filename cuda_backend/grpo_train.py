@@ -15,8 +15,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from cuda_backend import gsm8k_eval
-from data_preparation import gsm8k
+from cuda_backend import gsm8k_eval, xlam_function_calling_eval
+from data_preparation import gsm8k, xlam_function_calling
 
 
 def parse_args():
@@ -27,15 +27,21 @@ def parse_args():
 
     parser.add_argument(
         "--debug", action="store_true",
-        help="Overfit a tiny GSM8K subset (same samples for train and val; real answer reward)",
+        help="Overfit a tiny subset (same samples for train and val; real task reward)",
     )
     parser.add_argument(
         "--debug-samples", type=int, default=8,
-        help="Number of GSM8K samples in --debug mode (train and val use the same set)",
+        help="Number of samples in --debug mode (train and val use the same set)",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=("xlam-function-calling", "gsm8k"),
+        default="xlam-function-calling",
+        help="GRPO dataset and matching verifiable reward",
     )
     parser.add_argument(
         "--model", type=str,
-        default="Qwen/Qwen2-0.5B-Instruct",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
         help="Hugging Face base model, merged model, or local model directory",
     )
     parser.add_argument(
@@ -60,8 +66,8 @@ def parse_args():
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha (scale = alpha / rank)")
 
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization, data shuffle, and rollout sampling")
-    parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from GSM8K train set")
-    parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
+    parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from the selected training dataset")
+    parser.add_argument("--max-prompt-len", type=int, default=640, help="Skip selected-dataset prompts longer than this")
     parser.add_argument("--eval-every", type=int, default=50, help="Validate every N steps after the initial validation (-1 to disable)")
     parser.add_argument("--eval-batch-size", type=int, default=8, help="Prompts generated together during validation")
 
@@ -163,16 +169,23 @@ def load_policy_and_reference(args):
 
 
 def load_grpo_dataset(tokenizer, args):
-    print("Loading GSM8K dataset ...")
+    """Load the selected GRPO dataset with a deterministic runtime split."""
+    if args.dataset == "xlam-function-calling":
+        print("Loading xLAM function-calling dataset ...")
+        dataset_class = xlam_function_calling.XLAMFunctionCallingGRPODataset
+    else:
+        print("Loading GSM8K dataset ...")
+        dataset_class = gsm8k.GSM8KGRPODataset
+
     if args.debug:
-        return gsm8k.GSM8KGRPODataset.build_debug_overfit_datasets(
+        return dataset_class.build_debug_overfit_datasets(
             tokenizer,
             max_prompt_len=args.max_prompt_len,
             seed=args.seed,
             debug_samples=args.debug_samples,
         )
 
-    return gsm8k.GSM8KGRPODataset.build_train_val_datasets(
+    return dataset_class.build_train_val_datasets(
         tokenizer,
         max_prompt_len=args.max_prompt_len,
         val_split=args.val_split,
@@ -235,6 +248,57 @@ def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
     return selected_logprobs_masked
 
 
+def validate_policy(policy, val_dataset, tokenizer, args, writer, step, progress=None):
+    """Run and log the validation metrics for the selected GRPO dataset."""
+    if args.dataset == "xlam-function-calling":
+        metrics = xlam_function_calling_eval.validate(
+            policy,
+            val_dataset,
+            tokenizer,
+            args.max_new_tok,
+            args.eval_batch_size,
+        )
+        writer.add_scalar("val/accuracy", metrics["accuracy"], step)
+        writer.add_scalar("val/name_accuracy", metrics["name_accuracy"], step)
+        message = (
+            f"  [val] step {step:5d} | exact call accuracy "
+            f"{metrics['accuracy']:.4f} | name accuracy "
+            f"{metrics['name_accuracy']:.4f}"
+        )
+    else:
+        accuracy = gsm8k_eval.validate(
+            policy,
+            val_dataset,
+            tokenizer,
+            args.max_new_tok,
+            args.eval_batch_size,
+        )
+        writer.add_scalar("val/accuracy", accuracy, step)
+        message = f"  [val] step {step:5d} | accuracy {accuracy:.4f}"
+
+    if progress is None:
+        print(message)
+    else:
+        progress.write(message)
+
+
+def save_checkpoint(
+    policy, tokenizer, checkpoint_dir, step, training_start_time, learning_rate,
+):
+    """Save weights, tokenizer, elapsed hours, and the learning rate."""
+    checkpoint_path = os.path.join(checkpoint_dir, f"step_{step:06d}")
+    policy.save_pretrained(checkpoint_path)
+    tokenizer.save_pretrained(checkpoint_path)
+    metadata = {
+        "step": step,
+        "elapsed_hours": (time.monotonic() - training_start_time) / 3600,
+        "learning_rate": learning_rate,
+    }
+    with open(os.path.join(checkpoint_path, "metadata.json"), "w") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+    print(f"  [ckpt] step {step:5d} -> {checkpoint_path}")
+
+
 def main():
     """
     Tensor dimension notation:
@@ -294,15 +358,14 @@ def main():
     print(f"TensorBoard logs: tensorboard --logdir={args.tensorboard_dir}")
 
     if args.eval_every != -1:
-        val_accuracy = gsm8k_eval.validate(
+        validate_policy(
             policy,
             val_dataset,
             tokenizer,
-            args.max_new_tok,
-            args.eval_batch_size,
+            args,
+            writer,
+            step=0,
         )
-        writer.add_scalar("val/accuracy", val_accuracy, 0)
-        print(f"  [val] step {0:5d} | accuracy {val_accuracy:.4f}")
 
     total_steps = min(args.num_iters, len(train_samples))
     progress = tqdm(
@@ -312,6 +375,7 @@ def main():
         ncols=terminal_columns,
     )
     completed_steps = 0
+    training_start_time = time.monotonic()
 
     for step, sample in enumerate(train_samples):
         if step >= args.num_iters:
@@ -345,12 +409,24 @@ def main():
 
         rollouts_text = tokenizer.batch_decode(rollouts, skip_special_tokens=True) # G
 
-        ground_truth = sample["ground_truth"]
-        rewards = torch.tensor(
-            gsm8k.answer_rewards(rollouts_text, ground_truth),
-            dtype=torch.float32,
-            device=rollouts.device,
-        ) # [G]
+        if args.dataset == "xlam-function-calling":
+            rewards = torch.tensor(
+                xlam_function_calling.tool_call_rewards(
+                    rollouts_text,
+                    sample["answers"],
+                ),
+                dtype=torch.float32,
+                device=rollouts.device,
+            ) # [G]
+        else:
+            rewards = torch.tensor(
+                gsm8k.answer_rewards(
+                    rollouts_text,
+                    sample["ground_truth"],
+                ),
+                dtype=torch.float32,
+                device=rollouts.device,
+            ) # [G]
 
         advantage = (rewards - rewards.mean()) / (rewards.std(correction=0) + args.epsilon) # [G]
         advantage = advantage.unsqueeze(-1) # [G, 1]
@@ -447,28 +523,26 @@ def main():
         progress.update(1)
 
         if args.eval_every > 0 and completed_step % args.eval_every == 0:
-            val_accuracy = gsm8k_eval.validate(
+            validate_policy(
                 policy,
                 val_dataset,
                 tokenizer,
-                args.max_new_tok,
-                args.eval_batch_size,
-            )
-            writer.add_scalar("val/accuracy", val_accuracy, completed_step)
-            progress.write(
-                f"  [val] step {completed_step:5d} | "
-                f"accuracy {val_accuracy:.4f}"
+                args,
+                writer,
+                completed_step,
+                progress=progress,
             )
 
         if args.save_every > 0 and completed_step % args.save_every == 0:
             writer.flush()
-            checkpoint_path = os.path.join(
+            save_checkpoint(
+                policy,
+                tokenizer,
                 args.checkpoint_dir,
-                f"step_{completed_step:06d}",
+                completed_step,
+                training_start_time,
+                optimizer.param_groups[0]["lr"],
             )
-            policy.save_pretrained(checkpoint_path)
-            tokenizer.save_pretrained(checkpoint_path)
-            print(f"  [ckpt] step {completed_step:5d} -> {checkpoint_path}")
 
     progress.close()
 
@@ -478,13 +552,14 @@ def main():
         and completed_steps % args.save_every != 0
     ):
         writer.flush()
-        checkpoint_path = os.path.join(
+        save_checkpoint(
+            policy,
+            tokenizer,
             args.checkpoint_dir,
-            f"step_{completed_steps:06d}",
+            completed_steps,
+            training_start_time,
+            optimizer.param_groups[0]["lr"],
         )
-        policy.save_pretrained(checkpoint_path)
-        tokenizer.save_pretrained(checkpoint_path)
-        print(f"  [ckpt] step {completed_steps:5d} -> {checkpoint_path}")
 
     writer.close()
     sys.stdout.flush()

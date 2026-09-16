@@ -3,8 +3,7 @@ mlx-tune/
 nanochat/
 runs/
 checkpoints/
-scripts/*
-!scripts/evaluate_checkpoints.py
+experiments/
 .claude/
 .cursor/
 .agents/local/
@@ -24,3 +23,4 @@ data/xlam-function-calling-60k/*
 !data/xlam-function-calling-60k/prepare.py
 !data/xlam-function-calling-60k/README.md
 constraint_training_experiments_commands.md
+.agents/skills/maintain-paper-experiment-record

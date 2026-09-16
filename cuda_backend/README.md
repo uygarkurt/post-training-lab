@@ -29,14 +29,20 @@ uv run --extra cuda -m cuda_backend.sft_train
 
 # 2. GRPO: continue from an SFT adapter checkpoint
 uv run --extra cuda -m cuda_backend.grpo_train \
-  --model Qwen/Qwen2-0.5B-Instruct \
+  --dataset xlam-function-calling \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
   --adapter ./checkpoints/cuda/sft/sft_<timestamp>/step_000500
 
-# 3. Evaluate a GRPO adapter checkpoint on the GSM8K test split
-uv run --extra cuda -m cuda_backend.gsm8k_eval \
+# 3. Evaluate a GRPO adapter checkpoint on the local xLAM test split
+uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
   --model_path ./checkpoints/cuda/grpo/grpo_<timestamp>/step_000500 \
   --load-adapter
 ```
+
+xLAM is the default dataset for both CUDA training stages. GRPO uses exact
+tool-call-set correctness as its binary verifiable reward and reports exact
+call and function-name accuracy during validation. Use `--dataset gsm8k` to
+select the original numeric-answer dataset and reward.
 
 SFT uses 200 steps of warmup to `5e-5`, followed by cosine decay to `5e-6` by
 default. Its LoRA configuration uses rank 8, alpha 16, zero dropout, and all
@@ -75,10 +81,11 @@ Stopping early leaves the decay unfinished. For short runs, set
 TensorBoard's `train/learning_rate` and each SFT checkpoint's `metadata.json`
 record the rate used for that step's optimizer update, before the scheduler
 advances. The final recorded rate can therefore be slightly above `--min-lr`.
-Checkpoint metadata contains only `step`, `elapsed_hours`, and `learning_rate`;
-the run's `args.json` records the training arguments. Loading an adapter starts
-a new optimizer and schedule; metadata does not provide full training-state
-resumption.
+Each SFT and GRPO checkpoint stores only `step`, `elapsed_hours`, and
+`learning_rate` in `metadata.json`; the run's `args.json` records the training
+arguments. In both trainers, the elapsed timer starts immediately before the
+optimization loop, after initial validation. Loading an adapter starts a new
+optimizer; metadata does not provide full training-state resumption.
 
 ## Fast SFT smoke test
 
@@ -244,6 +251,21 @@ names, argument values and types, array order, missing calls, and extra calls
 remain significant. See the
 [xLAM data README](../data/xlam-function-calling-60k/README.md) for the complete
 recipe and limitations.
+
+Train GRPO on the prepared xLAM training pool, optionally initialized from an
+SFT adapter:
+
+```bash
+uv run --extra cuda -m cuda_backend.grpo_train \
+  --dataset xlam-function-calling \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --adapter ./checkpoints/cuda/sft/sft_<timestamp>/step_<number>
+```
+
+The default 640-token prompt limit retains 43,928 rows with the pinned Qwen
+tokenizer, before the seeded 5% runtime validation split. Overlong prompts are
+dropped whole. The binary reward uses the evaluator's strict exact-call-set
+rule; malformed, partial, extra, or missing calls receive zero reward.
 
 ## Entrypoints
 

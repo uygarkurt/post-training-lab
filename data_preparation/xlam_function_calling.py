@@ -1,4 +1,4 @@
-"""Local xLAM function-calling SFT data, evaluation prompts, and grading."""
+"""Local xLAM function-calling SFT/GRPO data, rewards, and evaluation."""
 
 import json
 import re
@@ -213,6 +213,101 @@ class XLAMFunctionCallingSFTDataset(Dataset):
         return train_dataset, val_dataset
 
 
+class XLAMFunctionCallingGRPODataset(Dataset):
+    """Tokenize and hold local xLAM prompts and reference calls for GRPO."""
+
+    def __init__(self, tokenizer, max_prompt_len):
+        """Load training rows and retain complete prompts within the limit."""
+        self.samples = []
+        self.total_rows = 0
+        self.skipped_overlong = 0
+        self.skipped_invalid = 0
+
+        for row in hf_load_dataset(
+            "json", data_files=str(TRAIN_DATASET_PATH), split="train",
+        ):
+            self.total_rows += 1
+            try:
+                query, tools, answers = parse_prepared_row(row)
+                prompt_text = render_prompt(tokenizer, query, tools)
+                prompt_ids = tokenizer.encode(prompt_text)
+            except (InvalidPreparedRowError, KeyError, json.JSONDecodeError):
+                self.skipped_invalid += 1
+                continue
+            if len(prompt_ids) > max_prompt_len:
+                self.skipped_overlong += 1
+                continue
+            self.samples.append({
+                "prompt_ids": prompt_ids,
+                "id": row["id"],
+                "query": query,
+                "tools": tools,
+                "answers": answers,
+            })
+
+    def __len__(self):
+        """Return the number of retained training samples."""
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        """Return one tokenized prompt and its reference tool calls."""
+        return self.samples[index]
+
+    def print_summary(self, destination):
+        """Print filtering statistics followed by a split description."""
+        print(
+            f"  {self.total_rows} rows loaded  "
+            f"→  {len(self)} retained / {self.skipped_overlong} overlong / "
+            f"{self.skipped_invalid} invalid  →  {destination}."
+        )
+
+    @classmethod
+    def build_train_val_datasets(
+        cls,
+        tokenizer,
+        max_prompt_len,
+        val_split,
+        seed,
+    ):
+        """Build deterministic xLAM GRPO training and validation datasets."""
+        dataset = cls(tokenizer, max_prompt_len=max_prompt_len)
+        n_val = max(1, int(len(dataset) * val_split))
+        n_train = len(dataset) - n_val
+        train_dataset, val_dataset = random_split(
+            dataset,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(seed),
+        )
+        dataset.print_summary(
+            f"{len(train_dataset)} train / {len(val_dataset)} val "
+            f"({val_split * 100:.0f}% val split)"
+        )
+        return train_dataset, val_dataset
+
+    @classmethod
+    def build_debug_overfit_datasets(
+        cls,
+        tokenizer,
+        max_prompt_len,
+        seed,
+        debug_samples,
+    ):
+        """Build matching tiny xLAM GRPO train and validation datasets."""
+        dataset = cls(tokenizer, max_prompt_len=max_prompt_len)
+        shuffled_indices = torch.randperm(
+            len(dataset),
+            generator=torch.Generator().manual_seed(seed),
+        ).tolist()
+        debug_indices = shuffled_indices[:min(debug_samples, len(dataset))]
+        train_dataset = Subset(dataset, debug_indices)
+        val_dataset = Subset(dataset, debug_indices)
+        dataset.print_summary(
+            f"debug overfit: {len(train_dataset)} xLAM samples "
+            "(same set for train and val)"
+        )
+        return train_dataset, val_dataset
+
+
 def _normalize_predicted_call(call):
     """Normalize one common tool-call object or reject it as malformed."""
     if not isinstance(call, dict):
@@ -283,6 +378,14 @@ def grade_tool_calls(completion_text, reference_calls):
         _canonical_call(call) for call in predicted_calls
     ) == Counter(_canonical_call(call) for call in reference_calls)
     return predicted_calls, names_correct, calls_correct
+
+
+def tool_call_rewards(rollouts_text, reference_calls):
+    """Return binary exact-call-set rewards for decoded completions."""
+    return [
+        float(grade_tool_calls(text, reference_calls)[2])
+        for text in rollouts_text
+    ]
 
 
 def _make_eval_collate_fn(tokenizer):
