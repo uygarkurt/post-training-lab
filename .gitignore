@@ -3,7 +3,7 @@ mlx-tune/
 nanochat/
 runs/
 checkpoints/
-experiments/
+experiments/*
 .claude/
 .cursor/
 .agents/local/
@@ -22,5 +22,13 @@ data/metamathqa/*
 data/xlam-function-calling-60k/*
 !data/xlam-function-calling-60k/prepare.py
 !data/xlam-function-calling-60k/README.md
+!data/xlam-function-calling-irrelevance/
+data/xlam-function-calling-irrelevance/*
+!data/xlam-function-calling-irrelevance/prepare.py
+!data/xlam-function-calling-irrelevance/README.md
 constraint_training_experiments_commands.md
 .agents/skills/maintain-paper-experiment-record
+!experiments/scripts/
+experiments/scripts/*
+!experiments/scripts/evaluate_checkpoints.py
+!experiments/scripts/evaluate_base_model.py

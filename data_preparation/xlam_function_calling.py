@@ -16,6 +16,10 @@ TRAIN_DATASET_PATH = (
     / "data/xlam-function-calling-60k/train.jsonl"
 )
 TEST_DATASET_PATH = TRAIN_DATASET_PATH.with_name("test.jsonl")
+MIXED_TRAIN_DATASET_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "data/xlam-function-calling-irrelevance/train.jsonl"
+)
 TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 
 
@@ -38,8 +42,8 @@ def _assistant_message(answers):
     }
 
 
-def parse_prepared_row(row):
-    """Decode and minimally validate one prepared xLAM row."""
+def parse_prepared_row(row, allow_empty_answers=False, allow_empty_tools=False):
+    """Decode one prepared row, optionally allowing no calls or no tools."""
     query = row["query"]
     tools = json.loads(row["tools"]) if isinstance(row["tools"], str) else row["tools"]
     answers = (
@@ -49,10 +53,12 @@ def parse_prepared_row(row):
     )
     if not isinstance(query, str) or not query.strip():
         raise InvalidPreparedRowError("query must be a nonempty string")
-    if not isinstance(tools, list) or not tools:
+    if not isinstance(tools, list) or (not tools and not allow_empty_tools):
         raise InvalidPreparedRowError("tools must be a nonempty list")
-    if not isinstance(answers, list) or not answers:
+    if not isinstance(answers, list) or (not answers and not allow_empty_answers):
         raise InvalidPreparedRowError("answers must be a nonempty list")
+    if not tools and answers:
+        raise InvalidPreparedRowError("a row without tools cannot contain a call")
     for tool in tools:
         if (
             not isinstance(tool, dict)
@@ -82,8 +88,7 @@ def render_prompt(tokenizer, query, tools):
         tokenize=False,
         add_generation_prompt=True,
     )
-    first_tool_name = tools[0]["function"]["name"]
-    if first_tool_name not in prompt_text:
+    if tools and tools[0]["function"]["name"] not in prompt_text:
         raise ToolTemplateError(
             "The tokenizer chat template did not render the provided tools"
         )
@@ -91,12 +96,16 @@ def render_prompt(tokenizer, query, tools):
 
 
 def encode_sft_example(tokenizer, query, tools, answers):
-    """Tokenize a tool-aware chat and mask its prompt tokens from SFT loss."""
+    """Tokenize a call or no-call chat and mask its prompt tokens from SFT loss."""
     prompt_text = render_prompt(tokenizer, query, tools)
+    assistant_message = (
+        _assistant_message(answers)
+        if answers else {"role": "assistant", "content": "[]"}
+    )
     full_text = tokenizer.apply_chat_template(
         [
             {"role": "user", "content": query},
-            _assistant_message(answers),
+            assistant_message,
         ],
         tools=tools,
         tokenize=False,
@@ -121,19 +130,26 @@ def encode_sft_example(tokenizer, query, tools, answers):
 class XLAMFunctionCallingSFTDataset(Dataset):
     """Tokenize and hold local xLAM function-calling examples for SFT."""
 
-    def __init__(self, tokenizer, max_seq_len):
+    def __init__(self, tokenizer, max_seq_len, dataset_path=TRAIN_DATASET_PATH):
         """Load training rows and retain complete examples within the limit."""
         self.samples = []
         self.total_rows = 0
         self.skipped_overlong = 0
         self.skipped_invalid = 0
+        self.no_call_rows = 0
+        self.retained_no_call = 0
+        self.skipped_no_call_overlong = 0
 
         for row in hf_load_dataset(
-            "json", data_files=str(TRAIN_DATASET_PATH), split="train",
+            "json", data_files=str(dataset_path), split="train",
         ):
             self.total_rows += 1
             try:
-                query, tools, answers = parse_prepared_row(row)
+                query, tools, answers = parse_prepared_row(
+                    row, allow_empty_answers=True, allow_empty_tools=True,
+                )
+                if not answers:
+                    self.no_call_rows += 1
                 sample = encode_sft_example(
                     tokenizer,
                     query,
@@ -147,8 +163,12 @@ class XLAMFunctionCallingSFTDataset(Dataset):
                 continue
             if len(sample["input_ids"]) > max_seq_len:
                 self.skipped_overlong += 1
+                if not answers:
+                    self.skipped_no_call_overlong += 1
                 continue
             self.samples.append(sample)
+            if not answers:
+                self.retained_no_call += 1
 
     def __len__(self):
         """Return the number of retained training samples."""
@@ -165,6 +185,11 @@ class XLAMFunctionCallingSFTDataset(Dataset):
             f"→  {len(self)} retained / {self.skipped_overlong} overlong / "
             f"{self.skipped_invalid} invalid  →  {destination}."
         )
+        if self.no_call_rows:
+            print(
+                f"  No-call rows: {self.retained_no_call}/{self.no_call_rows} retained; "
+                f"{self.skipped_no_call_overlong} overlong."
+            )
 
     @classmethod
     def build_train_val_datasets(
@@ -173,9 +198,12 @@ class XLAMFunctionCallingSFTDataset(Dataset):
         max_seq_len,
         val_split,
         seed,
+        dataset_path=TRAIN_DATASET_PATH,
     ):
         """Build deterministic xLAM training and validation datasets."""
-        dataset = cls(tokenizer, max_seq_len=max_seq_len)
+        dataset = cls(
+            tokenizer, max_seq_len=max_seq_len, dataset_path=dataset_path,
+        )
         n_val = max(1, int(len(dataset) * val_split))
         n_train = len(dataset) - n_val
         train_dataset, val_dataset = random_split(
@@ -196,9 +224,12 @@ class XLAMFunctionCallingSFTDataset(Dataset):
         max_seq_len,
         seed,
         debug_samples,
+        dataset_path=TRAIN_DATASET_PATH,
     ):
         """Build matching tiny xLAM train and validation datasets."""
-        dataset = cls(tokenizer, max_seq_len=max_seq_len)
+        dataset = cls(
+            tokenizer, max_seq_len=max_seq_len, dataset_path=dataset_path,
+        )
         shuffled_indices = torch.randperm(
             len(dataset),
             generator=torch.Generator().manual_seed(seed),
@@ -371,6 +402,20 @@ def _canonical_call(call):
 def grade_tool_calls(completion_text, reference_calls):
     """Grade unordered function names and complete calls for one completion."""
     predicted_calls = parse_tool_calls(completion_text)
+    if not reference_calls:
+        payload = completion_text.strip()
+        code_fence = re.fullmatch(
+            r"```(?:json)?\s*(.*?)\s*```", payload,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if code_fence:
+            payload = code_fence.group(1)
+        no_call = (
+            not predicted_calls
+            and "<tool_call" not in completion_text
+            and (not payload.startswith(("{", "[")) or payload == "[]")
+        )
+        return predicted_calls, no_call, no_call
     predicted_names = Counter(call["name"] for call in predicted_calls)
     reference_names = Counter(call["name"] for call in reference_calls)
     names_correct = bool(predicted_calls) and predicted_names == reference_names
@@ -443,7 +488,9 @@ class XLAMFunctionCallingEvalDataset(Dataset):
             "json", data_files={"test": str(dataset_path)}, split="test",
         ):
             try:
-                query, tools, answers = parse_prepared_row(row)
+                query, tools, answers = parse_prepared_row(
+                    row, allow_empty_answers=True, allow_empty_tools=True,
+                )
                 prompt_text = render_prompt(tokenizer, query, tools)
                 prompt_ids = tokenizer.encode(prompt_text)
             except (InvalidPreparedRowError, KeyError, json.JSONDecodeError):

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 from contextlib import nullcontext
 
 import torch
@@ -26,6 +27,14 @@ def validate(
     parsed_answers = 0
     total_answers = 0
     truncated_answers = 0
+    no_call_answers = 0
+    correct_no_call_answers = 0
+    no_tool_answers = 0
+    correct_no_tool_answers = 0
+    irrelevant_tool_answers = 0
+    correct_irrelevant_tool_answers = 0
+    call_answers = 0
+    correct_call_answers = 0
     device = next(policy.parameters()).device
     eos_token_ids = policy.generation_config.eos_token_id
     if eos_token_ids is None:
@@ -84,6 +93,18 @@ def validate(
                 correct_names += names_correct
                 correct_calls += calls_correct
                 truncated_answers += truncated
+                if batch["answers"][index]:
+                    call_answers += 1
+                    correct_call_answers += calls_correct
+                else:
+                    no_call_answers += 1
+                    correct_no_call_answers += calls_correct
+                    if batch["tools"][index]:
+                        irrelevant_tool_answers += 1
+                        correct_irrelevant_tool_answers += calls_correct
+                    else:
+                        no_tool_answers += 1
+                        correct_no_tool_answers += calls_correct
                 if output_file is not None:
                     output_file.write(json.dumps({
                         "id": batch["id"][index],
@@ -105,12 +126,34 @@ def validate(
     print(
         f"  {correct_calls}/{total_answers} exact call sets; "
         f"{correct_names}/{total_answers} function-name sets; "
-        f"{parsed_answers}/{total_answers} completions parsed; "
+        f"{parsed_answers}/{total_answers} completions with parsed calls; "
         f"{truncated_answers}/{total_answers} reached the token limit without EOS."
     )
+    if no_call_answers:
+        print(
+            f"  {correct_no_call_answers}/{no_call_answers} correct no-call responses; "
+            f"{correct_call_answers}/{call_answers} correct call responses."
+        )
+    if no_tool_answers:
+        print(
+            f"  {correct_no_tool_answers}/{no_tool_answers} correct with no tools; "
+            f"{correct_irrelevant_tool_answers}/{irrelevant_tool_answers} "
+            "correct with irrelevant tools."
+        )
     return {
         "accuracy": correct_calls / total_answers,
         "name_accuracy": correct_names / total_answers,
+        "no_call_accuracy": (
+            correct_no_call_answers / no_call_answers if no_call_answers else float("nan")
+        ),
+        "no_tool_accuracy": (
+            correct_no_tool_answers / no_tool_answers if no_tool_answers else float("nan")
+        ),
+        "irrelevant_tool_accuracy": (
+            correct_irrelevant_tool_answers / irrelevant_tool_answers
+            if irrelevant_tool_answers else float("nan")
+        ),
+        "call_accuracy": correct_call_answers / call_answers if call_answers else float("nan"),
     }
 
 
@@ -214,6 +257,12 @@ def main():
         )
     print(f"xLAM exact tool-call accuracy: {metrics['accuracy']:.4f}")
     print(f"xLAM function-name accuracy: {metrics['name_accuracy']:.4f}")
+    if math.isfinite(metrics["no_call_accuracy"]):
+        print(f"xLAM no-call accuracy: {metrics['no_call_accuracy']:.4f}")
+        print(f"xLAM call-required accuracy: {metrics['call_accuracy']:.4f}")
+    if math.isfinite(metrics["no_tool_accuracy"]):
+        print(f"xLAM no-tool accuracy: {metrics['no_tool_accuracy']:.4f}")
+        print(f"xLAM irrelevant-tool accuracy: {metrics['irrelevant_tool_accuracy']:.4f}")
     if args.output_jsonl:
         print(f"Evaluation completions saved to {args.output_jsonl}")
 

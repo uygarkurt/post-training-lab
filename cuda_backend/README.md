@@ -39,17 +39,18 @@ uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
   --load-adapter
 ```
 
-xLAM is the default dataset for both CUDA training stages. GRPO uses exact
-tool-call-set correctness as its binary verifiable reward and reports exact
-call and function-name accuracy during validation. Use `--dataset gsm8k` to
+SFT defaults to xLAM mixed with irrelevance examples. GRPO uses the original
+xLAM dataset and exact tool-call-set correctness as its binary verifiable
+reward and reports exact call and function-name accuracy during validation.
+Use `--dataset gsm8k` to
 select the original numeric-answer dataset and reward.
 
 SFT uses 200 steps of warmup to `5e-5`, followed by cosine decay to `5e-6` by
 default. Its LoRA configuration uses rank 8, alpha 16, zero dropout, and all
 linear layers. Training examples are shuffled deterministically, while
 validation reports response-token loss before training and every 50 steps
-by default. The default dataset is the prepared xLAM function-calling split,
-with a 2,048-token sequence limit.
+by default. The default dataset is the prepared xLAM and irrelevance split,
+with a 512-token sequence limit.
 
 ### SFT learning-rate schedule
 

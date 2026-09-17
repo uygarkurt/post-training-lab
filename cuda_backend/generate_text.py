@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import torch
 from peft import PeftConfig, PeftModel
@@ -60,12 +61,25 @@ def main():
         help="Prompt for text generation",
     )
     parser.add_argument(
+        "--tools-json",
+        type=str,
+        default=None,
+        help="JSON array of available function schemas",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=256,
         help="Maximum number of tokens to generate",
     )
     args = parser.parse_args()
+
+    try:
+        tools = json.loads(args.tools_json) if args.tools_json else None
+    except json.JSONDecodeError as error:
+        parser.error(f"--tools-json must be valid JSON: {error}")
+    if tools is not None and not isinstance(tools, list):
+        parser.error("--tools-json must contain a JSON array")
 
     model, tokenizer = load_model(args.model_path, args.load_adapter)
     model.eval()
@@ -75,6 +89,7 @@ def main():
     messages = [{"role": "user", "content": args.prompt}]
     formatted_prompt = tokenizer.apply_chat_template(
         messages,
+        tools=tools,
         tokenize=False,
         add_generation_prompt=True,
     )

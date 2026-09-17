@@ -91,8 +91,9 @@ tokens in this test split, and the assistant reference alone has a maximum of
 
 ## Supervised fine-tuning
 
-xLAM is the default CUDA SFT dataset. With the Qwen tokenizer revision measured
-above, the default 2,048-token limit retains 56,734 of 56,753 prepared training
+xLAM remains available for CUDA SFT with `--dataset xlam-function-calling`.
+With the Qwen tokenizer revision measured above, a 2,048-token limit
+retains 56,734 of 56,753 prepared training
 rows. The 19 longer training rows are discarded rather than truncated. Recheck
 this distribution if the model or chat template changes:
 
