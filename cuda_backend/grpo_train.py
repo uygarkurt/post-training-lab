@@ -6,6 +6,7 @@ import random
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import UTC, datetime
 
 import numpy as np
@@ -72,6 +73,7 @@ def parse_args():
     parser.add_argument("--eval-batch-size", type=int, default=8, help="Prompts generated together during validation")
 
     parser.add_argument("--tensorboard-dir", type=str, default="./runs/cuda/grpo", help="Base path for timestamped TensorBoard run directories")
+    parser.add_argument("--group-metric-window", type=int, default=100, help="Recent prompt groups in TensorBoard reward-outcome fractions")
 
     parser.add_argument("--save-every", type=int, default=100, help="Save a model checkpoint every N steps (0 to disable)")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/cuda/grpo", help="Base path for timestamped checkpoint directories")
@@ -79,6 +81,8 @@ def parse_args():
     args = parser.parse_args()
     if args.ppo_epochs < 1:
         parser.error("--ppo-epochs must be at least 1")
+    if args.group_metric_window < 1:
+        parser.error("--group-metric-window must be at least 1")
     return args
 
 
@@ -367,19 +371,27 @@ def main():
             step=0,
         )
 
-    total_steps = min(args.num_iters, len(train_samples))
+    batches_per_epoch = len(train_samples)
+    total_steps = args.num_iters if batches_per_epoch else 0
+    learning_rate_display = f"{optimizer.param_groups[0]['lr']:.3g}".replace("e-0", "e-")
     progress = tqdm(
         total=total_steps,
-        desc="train loss=----",
+        desc=(
+            f"epoch=1 batch=0/{batches_per_epoch} loss=---- "
+            f"lr={learning_rate_display}"
+        ),
         unit="step",
         ncols=terminal_columns,
     )
     completed_steps = 0
     training_start_time = time.monotonic()
+    # One prompt per step: aggregate group outcomes across steps for readable curves.
+    recent_group_rewards = deque(maxlen=args.group_metric_window)
 
-    for step, sample in enumerate(train_samples):
-        if step >= args.num_iters:
-            break
+    for step in range(total_steps):
+        epoch_number, batch_offset = divmod(step, batches_per_epoch)
+        batch_index = batch_offset + 1
+        sample = train_samples[batch_offset]
         step_start_time = time.time()
 
         prompt_tensor = torch.tensor(sample['prompt_ids'], dtype=torch.long, device="cuda").unsqueeze(0)  # [1, P]
@@ -485,6 +497,7 @@ def main():
         ).mean().float().item()
         mean_reward = rewards.mean().item()
         reward_std = rewards.std(correction=0).item()
+        recent_group_rewards.append(mean_reward)
         truncated_rollout_fraction = truncated_rollouts.float().mean().item()
         completion_tokens = rollout_masks.sum().item()
         tokens_per_second = completion_tokens / max(
@@ -505,6 +518,13 @@ def main():
             float(reward_std > 0.0),
             completed_step,
         )
+        if len(recent_group_rewards) == args.group_metric_window:
+            metric_prefix = f"train/group_fraction_{args.group_metric_window}"
+            all_wrong_fraction = recent_group_rewards.count(0.0) / args.group_metric_window
+            all_correct_fraction = recent_group_rewards.count(1.0) / args.group_metric_window
+            writer.add_scalar(f"{metric_prefix}/all_wrong", all_wrong_fraction, completed_step)
+            writer.add_scalar(f"{metric_prefix}/mixed", 1.0 - all_wrong_fraction - all_correct_fraction, completed_step)
+            writer.add_scalar(f"{metric_prefix}/all_correct", all_correct_fraction, completed_step)
         writer.add_scalar("train/kl", mean_kl, completed_step)
         writer.add_scalar("train/grad_norm", mean_gradient_norm, completed_step)
         writer.add_scalar("train/learning_rate", args.lr, completed_step)
@@ -519,7 +539,12 @@ def main():
             completed_step,
         )
 
-        progress.set_description(f"train loss={mean_loss:.4f}")
+        learning_rate_display = f"{optimizer.param_groups[0]['lr']:.3g}".replace("e-0", "e-")
+        progress.set_description(
+            f"epoch={epoch_number + 1} batch={batch_index}/{batches_per_epoch} "
+            f"loss={mean_loss:.4f} lr={learning_rate_display}",
+            refresh=False,
+        )
         progress.update(1)
 
         if args.eval_every > 0 and completed_step % args.eval_every == 0:
