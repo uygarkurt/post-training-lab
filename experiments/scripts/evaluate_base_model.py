@@ -33,29 +33,6 @@ SPREADSHEET_HEADERS = (
     "Relevance",
     "Irrelevance",
 )
-BFCL_FUNCTION_CALLING_SUBSETS = (
-    "simple",
-    "multiple",
-    "parallel",
-    "parallel_multiple",
-    "live_simple",
-    "live_multiple",
-    "live_parallel",
-    "live_parallel_multiple",
-)
-EXPECTED_BFCL_SAMPLE_COUNTS = {
-    "simple": 400,
-    "multiple": 200,
-    "parallel": 200,
-    "parallel_multiple": 200,
-    "live_simple": 258,
-    "live_multiple": 1053,
-    "live_parallel": 16,
-    "live_parallel_multiple": 24,
-    "irrelevance": 240,
-    "live_relevance": 18,
-    "live_irrelevance": 882,
-}
 
 
 def parse_args(argv=None):
@@ -110,38 +87,6 @@ def run_xlam(model, temporary_path):
     ]
     checkpoint_evaluator.run_logged(command, log_path)
     return checkpoint_evaluator.parse_xlam_results(predictions_path, log_path)
-
-
-def paper_bfcl_metrics(metrics):
-    """Calculate the paper's three BFCL metrics from selected subset scores."""
-    for name, expected_count in EXPECTED_BFCL_SAMPLE_COUNTS.items():
-        actual_count = metrics[name]["samples"]
-        if actual_count != expected_count:
-            raise ValueError(
-                f"BFCL {name} returned {actual_count} samples; "
-                f"the recorded protocol requires {expected_count}"
-            )
-
-    function_calling_count = sum(
-        metrics[name]["samples"] for name in BFCL_FUNCTION_CALLING_SUBSETS
-    )
-    function_calling_correct = sum(
-        metrics[name]["samples"] * metrics[name]["accuracy"]
-        for name in BFCL_FUNCTION_CALLING_SUBSETS
-    )
-    irrelevance_subsets = ("irrelevance", "live_irrelevance")
-    irrelevance_count = sum(
-        metrics[name]["samples"] for name in irrelevance_subsets
-    )
-    irrelevance_correct = sum(
-        metrics[name]["samples"] * metrics[name]["accuracy"]
-        for name in irrelevance_subsets
-    )
-    return {
-        "single_turn_fc": function_calling_correct / function_calling_count,
-        "relevance": metrics["live_relevance"]["accuracy"],
-        "irrelevance": irrelevance_correct / irrelevance_count,
-    }
 
 
 def run_bfcl(model, temporary_path):
@@ -233,9 +178,7 @@ def run_bfcl(model, temporary_path):
         finally:
             checkpoint_evaluator.stop_vllm_process(process)
 
-    metrics = checkpoint_evaluator.parse_bfcl_results(work_dir)
-    metrics["_paper_metrics"] = paper_bfcl_metrics(metrics)
-    return metrics
+    return checkpoint_evaluator.parse_bfcl_results(work_dir)
 
 
 def run_lm_eval(model, temporary_path):
@@ -365,6 +308,17 @@ def render_markdown(evaluation):
         ]
     )
 
+    bfcl = evaluation["suites"]["bfcl"]
+    if bfcl["status"] == "success":
+        lines.extend(
+            [
+                "",
+                "## BFCL-v3 selected single-turn suite",
+                "",
+                *checkpoint_evaluator.render_bfcl_paper_metrics(bfcl["metrics"]),
+            ]
+        )
+
     failures = [
         (suite_titles[name], result)
         for name, result in evaluation["suites"].items()
@@ -431,17 +385,8 @@ def render_full_markdown(evaluation):
     bfcl = evaluation["suites"]["bfcl"]
     if bfcl["status"] == "success":
         metrics = bfcl["metrics"]
-        paper_metrics = metrics["_paper_metrics"]
         lines.extend(
             [
-                "",
-                "### BFCL paper metrics",
-                "",
-                "| Metric | Accuracy |",
-                "| --- | ---: |",
-                f"| Single-turn FC | {paper_metrics['single_turn_fc']} |",
-                f"| Relevance | {paper_metrics['relevance']} |",
-                f"| Irrelevance | {paper_metrics['irrelevance']} |",
                 "",
                 "### BFCL selected subsets",
                 "",

@@ -23,7 +23,7 @@ REPORT_NAME = "evaluation_results.md"
 FULL_REPORT_NAME = "evaluation_results_full.md"
 STEP_PATTERN = re.compile(r"step_(\d+)")
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-BFCL_SUBSETS = (
+BFCL_FUNCTION_CALLING_SUBSETS = (
     "simple",
     "multiple",
     "parallel",
@@ -32,10 +32,26 @@ BFCL_SUBSETS = (
     "live_multiple",
     "live_parallel",
     "live_parallel_multiple",
+)
+BFCL_SUBSETS = (
+    *BFCL_FUNCTION_CALLING_SUBSETS,
     "irrelevance",
     "live_relevance",
     "live_irrelevance",
 )
+EXPECTED_BFCL_SAMPLE_COUNTS = {
+    "simple": 400,
+    "multiple": 200,
+    "parallel": 200,
+    "parallel_multiple": 200,
+    "live_simple": 258,
+    "live_multiple": 1053,
+    "live_parallel": 16,
+    "live_parallel_multiple": 24,
+    "irrelevance": 240,
+    "live_relevance": 18,
+    "live_irrelevance": 882,
+}
 SERVER_STARTUP_TIMEOUT_SECONDS = 600
 SERVER_SHUTDOWN_TIMEOUT_SECONDS = 30
 DIAGNOSTIC_LINE_LIMIT = 20
@@ -236,7 +252,7 @@ def numeric_value(value, description):
 
 
 def parse_bfcl_results(work_dir):
-    """Extract selected BFCL subsets and aggregates from an EvalScope report."""
+    """Extract selected BFCL subsets and paper metrics from an EvalScope report."""
     report_path = find_single_file(
         work_dir / "reports", "bfcl_v3.json", "BFCL report"
     )
@@ -249,14 +265,8 @@ def parse_bfcl_results(work_dir):
                 if isinstance(name, str):
                     subsets[name.casefold()] = subset
 
-    required = (
-        "non_live",
-        "live",
-        "overall",
-        *BFCL_SUBSETS,
-    )
     results = {}
-    for name in required:
+    for name in BFCL_SUBSETS:
         if name not in subsets:
             raise ValueError(f"BFCL report is missing the {name} subset")
         subset = subsets[name]
@@ -267,8 +277,39 @@ def parse_bfcl_results(work_dir):
             "accuracy": numeric_value(subset.get("score"), f"BFCL {name}"),
             "samples": count,
         }
+    results["_paper_metrics"] = paper_bfcl_metrics(results)
     results["_full_report"] = report
     return results
+
+
+def paper_bfcl_metrics(metrics):
+    """Micro-average the paper's single-turn and irrelevance subsets."""
+    for name, expected_count in EXPECTED_BFCL_SAMPLE_COUNTS.items():
+        actual_count = metrics[name]["samples"]
+        if actual_count != expected_count:
+            raise ValueError(
+                f"BFCL {name} returned {actual_count} samples; "
+                f"the recorded protocol requires {expected_count}"
+            )
+
+    function_calling_count = sum(
+        metrics[name]["samples"] for name in BFCL_FUNCTION_CALLING_SUBSETS
+    )
+    function_calling_correct = sum(
+        metrics[name]["samples"] * metrics[name]["accuracy"]
+        for name in BFCL_FUNCTION_CALLING_SUBSETS
+    )
+    irrelevance_subsets = ("irrelevance", "live_irrelevance")
+    irrelevance_count = sum(metrics[name]["samples"] for name in irrelevance_subsets)
+    irrelevance_correct = sum(
+        metrics[name]["samples"] * metrics[name]["accuracy"]
+        for name in irrelevance_subsets
+    )
+    return {
+        "single_turn_fc": function_calling_correct / function_calling_count,
+        "relevance": metrics["live_relevance"]["accuracy"],
+        "irrelevance": irrelevance_correct / irrelevance_count,
+    }
 
 
 def metric_from_task(results, section, task, metric):
@@ -581,6 +622,34 @@ def markdown_diagnostic(text):
     return (text or "No diagnostic output was captured.").replace("```", "` ` `")
 
 
+def render_bfcl_paper_metrics(metrics):
+    """Render the three custom BFCL scores with their sample counts."""
+    paper_metrics = metrics["_paper_metrics"]
+    rows = (
+        (
+            "Single-turn Function Calling",
+            BFCL_FUNCTION_CALLING_SUBSETS,
+            "single_turn_fc",
+        ),
+        ("Relevance", ("live_relevance",), "relevance"),
+        ("Irrelevance", ("irrelevance", "live_irrelevance"), "irrelevance"),
+    )
+    lines = [
+        "### Paper-level metrics",
+        "",
+        "Custom single-turn reporting metrics, not official BFCL aggregates. "
+        "Single-turn Function Calling and Irrelevance are micro-averages "
+        "weighted by subset sample counts.",
+        "",
+        "| Metric | Samples | Accuracy |",
+        "| --- | ---: | ---: |",
+    ]
+    for label, subsets, key in rows:
+        samples = sum(metrics[name]["samples"] for name in subsets)
+        lines.append(f"| {label} | {samples} | {percentage(paper_metrics[key])} |")
+    return lines
+
+
 def render_markdown(evaluation):
     """Render a concise human-readable checkpoint evaluation report."""
     suite_titles = {
@@ -634,27 +703,14 @@ def render_markdown(evaluation):
     bfcl = evaluation["suites"].get("bfcl")
     if bfcl and bfcl["status"] == "success":
         metrics = bfcl["metrics"]
-        aggregate_labels = (
-            ("non_live", "Selected-suite non-live"),
-            ("live", "Selected-suite live"),
-            ("overall", "Selected-suite overall (not full BFCL-v3)"),
-        )
         lines.extend(
             [
                 "",
                 "## BFCL-v3 selected single-turn suite",
                 "",
-                "### Aggregates",
-                "",
-                "| Metric | Samples | Accuracy |",
-                "| --- | ---: | ---: |",
+                *render_bfcl_paper_metrics(metrics),
             ]
         )
-        for name, label in aggregate_labels:
-            result = metrics[name]
-            lines.append(
-                f"| {label} | {result['samples']} | {percentage(result['accuracy'])} |"
-            )
         lines.extend(
             [
                 "",
