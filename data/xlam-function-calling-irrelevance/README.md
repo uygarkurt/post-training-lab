@@ -48,42 +48,5 @@ positive rows and 6,034 irrelevant-tool no-call rows. The mixed files contain
 no-calls for testing. Of the 7,500 irrelevance source rows, 1,446 have no
 available tools and are excluded; 20 have duplicate available-tool names and
 are excluded. The manifest records these exclusions and the generated file
-hashes. Length filtering occurs later in the SFT loader, so inspect its
+hashes. Length filtering occurs later in the SFT or GRPO loader, so inspect its
 retained and overlong counts for the chosen tokenizer and sequence limit.
-
-## CUDA SFT and evaluation
-
-This mixed dataset is the default for CUDA SFT. Specify
-`--dataset xlam-function-calling` to train on the original positive-only split.
-
-```bash
-uv run --extra cuda -m cuda_backend.sft_train \
-  --dataset xlam-function-calling-irrelevance \
-  --max-seq-len 896
-
-uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
-  --model_path checkpoints/cuda/sft/YOUR_RUN/step_XXXXXX \
-  --load-adapter \
-  --dataset-path data/xlam-function-calling-irrelevance/test.jsonl
-```
-
-SFT uses the model's tool-aware chat template. Positive targets remain native
-assistant tool calls; negative targets are ordinary assistant messages
-containing `[]`, with no tool call. The prompt is masked from the loss in both
-cases. No-tools chat behavior is outside this tool-routing dataset; it must be
-checked separately after training.
-The existing SFT trainer takes a further seeded 5% runtime validation split
-from the prepared training file; this row-level split may separate two
-versions of the same query. Use the prepared mixed test file for held-out
-evaluation.
-
-The evaluator reports overall exact call-set accuracy, call-required accuracy,
-and irrelevant-tool no-call accuracy. The regenerated local test file has
-3,289 prompts; the evaluator applies its prompt cap when loading them. This is
-a holdout from synthetic training sources, not an official BFCL test.
-This preparation is for SFT; the existing GRPO dataset remains the original
-positive-only xLAM training file.
-
-The earlier mixed SFT pilot used a previous preparation that included no-tool
-rows targeted to `[]`. Its checkpoint was not trained on the corrected files
-and should be reported with that earlier dataset version.

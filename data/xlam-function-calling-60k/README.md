@@ -106,4 +106,12 @@ uv run --extra cuda -m cuda_backend.sft_train \
 The loader reads only `train.jsonl`, uses the tokenizer's tool-aware chat
 template, and computes loss only on the assistant tool calls. Its seeded
 runtime validation subset comes from the prepared training file. The prepared
-test file is never loaded during SFT. GRPO integration is not included.
+test file is never loaded during SFT.
+
+## Group Relative Policy Optimization
+
+CUDA GRPO uses this positive-only training pool with
+`--dataset xlam-function-calling`. At the default 640-token prompt limit, the
+pinned Qwen tokenizer retains 43,928 rows. To include irrelevant-tool no-call
+examples and train abstention, use `--dataset xlam-function-calling-irrelevance`
+with the [mixed preparation](../xlam-function-calling-irrelevance/README.md).

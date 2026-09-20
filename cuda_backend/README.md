@@ -29,21 +29,24 @@ uv run --extra cuda -m cuda_backend.sft_train
 
 # 2. GRPO: continue from an SFT adapter checkpoint
 uv run --extra cuda -m cuda_backend.grpo_train \
-  --dataset xlam-function-calling \
+  --dataset xlam-function-calling-irrelevance \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --adapter ./checkpoints/cuda/sft/sft_<timestamp>/step_000500
 
 # 3. Evaluate a GRPO adapter checkpoint on the local xLAM test split
 uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
   --model_path ./checkpoints/cuda/grpo/grpo_<timestamp>/step_000500 \
-  --load-adapter
+  --load-adapter \
+  --dataset-path data/xlam-function-calling-irrelevance/test.jsonl
 ```
 
-SFT defaults to xLAM mixed with irrelevance examples. GRPO uses the original
-xLAM dataset and exact tool-call-set correctness as its binary verifiable
-reward and reports exact call and function-name accuracy during validation.
-Use `--dataset gsm8k` to
-select the original numeric-answer dataset and reward.
+SFT defaults to xLAM mixed with irrelevance examples. GRPO supports that same
+mixture with `--dataset xlam-function-calling-irrelevance`, or the original
+positive-only data with `--dataset xlam-function-calling`. Its binary reward
+checks exact tool-call sets for positive examples and correct abstention for
+irrelevance examples. Validation reports overall exact and function-name
+accuracy plus separate call and no-call accuracy when applicable. Use
+`--dataset gsm8k` to select the original numeric-answer dataset and reward.
 
 SFT uses 200 steps of warmup to `5e-5`, followed by cosine decay to `5e-6` by
 default. Its LoRA configuration uses rank 8, alpha 16, zero dropout, and all
@@ -253,20 +256,35 @@ remain significant. See the
 [xLAM data README](../data/xlam-function-calling-60k/README.md) for the complete
 recipe and limitations.
 
-Train GRPO on the prepared xLAM training pool, optionally initialized from an
-SFT adapter:
+Train GRPO on the prepared xLAM and irrelevance training pool, optionally
+initialized from an SFT adapter:
 
 ```bash
 uv run --extra cuda -m cuda_backend.grpo_train \
-  --dataset xlam-function-calling \
+  --dataset xlam-function-calling-irrelevance \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --adapter ./checkpoints/cuda/sft/sft_<timestamp>/step_<number>
 ```
 
-The default 640-token prompt limit retains 43,928 rows with the pinned Qwen
-tokenizer, before the seeded 5% runtime validation split. Overlong prompts are
-dropped whole. The binary reward uses the evaluator's strict exact-call-set
-rule; malformed, partial, extra, or missing calls receive zero reward.
+The mixed training file contains 56,753 call examples and 5,732 irrelevant-tool
+no-call examples. With the pinned Qwen tokenizer, the default 640-token prompt
+limit retains 43,928 calls and 4,863 no-calls before the seeded 5% runtime
+validation split. Overlong prompts are dropped whole. The binary reward uses
+the following contract:
+
+- Predictions may contain Qwen-style `<tool_call>` blocks or a bare JSON
+  object or list, optionally wrapped in a complete JSON code fence.
+- Calls are normalized to a function name and argument object. JSON object key
+  order and parallel-call order do not matter; JSON types, values, array order,
+  duplicate calls, missing calls, and extra calls do matter.
+- A call-required rollout receives 1 only for an exact normalized call-multiset
+  match. Malformed, partial, extra, or missing calls receive 0.
+- A no-call rollout receives 1 for literal `[]` or ordinary non-tool-call text.
+  A parsed call, attempted `<tool_call` tag, or other JSON-like attempted call
+  receives 0.
+- There is no format, function-name, or partial-argument reward shaping.
+
+Use `--dataset xlam-function-calling` for the positive-only pool.
 
 ## Entrypoints
 

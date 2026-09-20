@@ -83,7 +83,7 @@ def validate(
 
             for index, text in enumerate(completion_texts):
                 predicted_calls, names_correct, calls_correct = (
-                    xlam_function_calling.grade_tool_calls(
+                    xlam_function_calling.tool_call_reward(
                         text,
                         batch["answers"][index],
                     )

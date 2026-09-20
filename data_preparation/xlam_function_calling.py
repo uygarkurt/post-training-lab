@@ -9,8 +9,6 @@ import torch
 from datasets import load_dataset as hf_load_dataset
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
-from data_preparation.sft import build_sft_dataloader
-
 TRAIN_DATASET_PATH = (
     Path(__file__).resolve().parents[1]
     / "data/xlam-function-calling-60k/train.jsonl"
@@ -247,19 +245,28 @@ class XLAMFunctionCallingSFTDataset(Dataset):
 class XLAMFunctionCallingGRPODataset(Dataset):
     """Tokenize and hold local xLAM prompts and reference calls for GRPO."""
 
-    def __init__(self, tokenizer, max_prompt_len):
+    def __init__(
+        self, tokenizer, max_prompt_len, dataset_path=TRAIN_DATASET_PATH,
+    ):
         """Load training rows and retain complete prompts within the limit."""
         self.samples = []
         self.total_rows = 0
         self.skipped_overlong = 0
         self.skipped_invalid = 0
+        self.no_call_rows = 0
+        self.retained_no_call = 0
+        self.skipped_no_call_overlong = 0
 
         for row in hf_load_dataset(
-            "json", data_files=str(TRAIN_DATASET_PATH), split="train",
+            "json", data_files=str(dataset_path), split="train",
         ):
             self.total_rows += 1
             try:
-                query, tools, answers = parse_prepared_row(row)
+                query, tools, answers = parse_prepared_row(
+                    row, allow_empty_answers=True,
+                )
+                if not answers:
+                    self.no_call_rows += 1
                 prompt_text = render_prompt(tokenizer, query, tools)
                 prompt_ids = tokenizer.encode(prompt_text)
             except (InvalidPreparedRowError, KeyError, json.JSONDecodeError):
@@ -267,6 +274,8 @@ class XLAMFunctionCallingGRPODataset(Dataset):
                 continue
             if len(prompt_ids) > max_prompt_len:
                 self.skipped_overlong += 1
+                if not answers:
+                    self.skipped_no_call_overlong += 1
                 continue
             self.samples.append({
                 "prompt_ids": prompt_ids,
@@ -275,6 +284,8 @@ class XLAMFunctionCallingGRPODataset(Dataset):
                 "tools": tools,
                 "answers": answers,
             })
+            if not answers:
+                self.retained_no_call += 1
 
     def __len__(self):
         """Return the number of retained training samples."""
@@ -291,6 +302,11 @@ class XLAMFunctionCallingGRPODataset(Dataset):
             f"→  {len(self)} retained / {self.skipped_overlong} overlong / "
             f"{self.skipped_invalid} invalid  →  {destination}."
         )
+        if self.no_call_rows:
+            print(
+                f"  No-call rows: {self.retained_no_call}/{self.no_call_rows} retained; "
+                f"{self.skipped_no_call_overlong} overlong."
+            )
 
     @classmethod
     def build_train_val_datasets(
@@ -299,9 +315,14 @@ class XLAMFunctionCallingGRPODataset(Dataset):
         max_prompt_len,
         val_split,
         seed,
+        dataset_path=TRAIN_DATASET_PATH,
     ):
         """Build deterministic xLAM GRPO training and validation datasets."""
-        dataset = cls(tokenizer, max_prompt_len=max_prompt_len)
+        dataset = cls(
+            tokenizer,
+            max_prompt_len=max_prompt_len,
+            dataset_path=dataset_path,
+        )
         n_val = max(1, int(len(dataset) * val_split))
         n_train = len(dataset) - n_val
         train_dataset, val_dataset = random_split(
@@ -322,9 +343,14 @@ class XLAMFunctionCallingGRPODataset(Dataset):
         max_prompt_len,
         seed,
         debug_samples,
+        dataset_path=TRAIN_DATASET_PATH,
     ):
         """Build matching tiny xLAM GRPO train and validation datasets."""
-        dataset = cls(tokenizer, max_prompt_len=max_prompt_len)
+        dataset = cls(
+            tokenizer,
+            max_prompt_len=max_prompt_len,
+            dataset_path=dataset_path,
+        )
         shuffled_indices = torch.randperm(
             len(dataset),
             generator=torch.Generator().manual_seed(seed),
@@ -399,9 +425,10 @@ def _canonical_call(call):
     )
 
 
-def grade_tool_calls(completion_text, reference_calls):
-    """Grade unordered function names and complete calls for one completion."""
+def tool_call_reward(completion_text, reference_calls):
+    """Return parsed calls, name correctness, and the binary exact reward."""
     predicted_calls = parse_tool_calls(completion_text)
+
     if not reference_calls:
         payload = completion_text.strip()
         code_fence = re.fullmatch(
@@ -410,27 +437,27 @@ def grade_tool_calls(completion_text, reference_calls):
         )
         if code_fence:
             payload = code_fence.group(1)
-        no_call = (
-            not predicted_calls
-            and "<tool_call" not in completion_text
-            and (not payload.startswith(("{", "[")) or payload == "[]")
-        )
-        return predicted_calls, no_call, no_call
+
+        if predicted_calls:
+            return predicted_calls, False, False
+        if "<tool_call" in completion_text:
+            return predicted_calls, False, False
+        if payload == "[]":
+            return predicted_calls, True, True
+        if payload.startswith(("{", "[")):
+            return predicted_calls, False, False
+        return predicted_calls, True, True
+
+    if not predicted_calls:
+        return predicted_calls, False, False
+
     predicted_names = Counter(call["name"] for call in predicted_calls)
     reference_names = Counter(call["name"] for call in reference_calls)
-    names_correct = bool(predicted_calls) and predicted_names == reference_names
-    calls_correct = bool(predicted_calls) and Counter(
+    names_correct = predicted_names == reference_names
+    calls_correct = Counter(
         _canonical_call(call) for call in predicted_calls
     ) == Counter(_canonical_call(call) for call in reference_calls)
     return predicted_calls, names_correct, calls_correct
-
-
-def tool_call_rewards(rollouts_text, reference_calls):
-    """Return binary exact-call-set rewards for decoded completions."""
-    return [
-        float(grade_tool_calls(text, reference_calls)[2])
-        for text in rollouts_text
-    ]
 
 
 def _make_eval_collate_fn(tokenizer):

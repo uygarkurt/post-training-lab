@@ -123,15 +123,16 @@ Train xLAM with GRPO, optionally continuing an SFT adapter:
 
 ```bash
 uv run --extra cuda -m cuda_backend.grpo_train \
-  --dataset xlam-function-calling \
+  --dataset xlam-function-calling-irrelevance \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --adapter ./checkpoints/cuda/sft/sft_<timestamp>/step_<number>
 ```
 
 The evaluator uses each model's native tool-aware chat template and reports
-exact call-set and function-name-set accuracy. See the
-[xLAM data README](data/xlam-function-calling-60k/README.md) for preparation,
-grading, SFT, GRPO rewards, and reproducibility details.
+exact call-set and function-name-set accuracy. The mixed GRPO dataset also
+trains and validates abstention when offered tools are irrelevant. See the
+[mixed xLAM data README](data/xlam-function-calling-irrelevance/README.md) for
+preparation, grading, SFT, GRPO rewards, and reproducibility details.
 
 ## Citation
 

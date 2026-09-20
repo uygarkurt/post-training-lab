@@ -19,6 +19,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from cuda_backend import gsm8k_eval, xlam_function_calling_eval
 from data_preparation import gsm8k, xlam_function_calling
 
+XLAM_DATASETS = (
+    "xlam-function-calling",
+    "xlam-function-calling-irrelevance",
+)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -36,7 +41,7 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset",
-        choices=("xlam-function-calling", "gsm8k"),
+        choices=(*XLAM_DATASETS, "gsm8k"),
         default="xlam-function-calling",
         help="GRPO dataset and matching verifiable reward",
     )
@@ -174,9 +179,14 @@ def load_policy_and_reference(args):
 
 def load_grpo_dataset(tokenizer, args):
     """Load the selected GRPO dataset with a deterministic runtime split."""
-    if args.dataset == "xlam-function-calling":
+    dataset_kwargs = {}
+    if args.dataset in XLAM_DATASETS:
         print("Loading xLAM function-calling dataset ...")
         dataset_class = xlam_function_calling.XLAMFunctionCallingGRPODataset
+        if args.dataset == "xlam-function-calling-irrelevance":
+            dataset_kwargs["dataset_path"] = (
+                xlam_function_calling.MIXED_TRAIN_DATASET_PATH
+            )
     else:
         print("Loading GSM8K dataset ...")
         dataset_class = gsm8k.GSM8KGRPODataset
@@ -187,6 +197,7 @@ def load_grpo_dataset(tokenizer, args):
             max_prompt_len=args.max_prompt_len,
             seed=args.seed,
             debug_samples=args.debug_samples,
+            **dataset_kwargs,
         )
 
     return dataset_class.build_train_val_datasets(
@@ -194,6 +205,7 @@ def load_grpo_dataset(tokenizer, args):
         max_prompt_len=args.max_prompt_len,
         val_split=args.val_split,
         seed=args.seed,
+        **dataset_kwargs,
     )
 
 
@@ -254,7 +266,7 @@ def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
 
 def validate_policy(policy, val_dataset, tokenizer, args, writer, step, progress=None):
     """Run and log the validation metrics for the selected GRPO dataset."""
-    if args.dataset == "xlam-function-calling":
+    if args.dataset in XLAM_DATASETS:
         metrics = xlam_function_calling_eval.validate(
             policy,
             val_dataset,
@@ -264,11 +276,33 @@ def validate_policy(policy, val_dataset, tokenizer, args, writer, step, progress
         )
         writer.add_scalar("val/accuracy", metrics["accuracy"], step)
         writer.add_scalar("val/name_accuracy", metrics["name_accuracy"], step)
+        call_accuracy = metrics.get("call_accuracy", float("nan"))
+        no_call_accuracy = metrics.get("no_call_accuracy", float("nan"))
+        irrelevant_tool_accuracy = metrics.get(
+            "irrelevant_tool_accuracy", float("nan"),
+        )
+        if not np.isnan(call_accuracy):
+            writer.add_scalar("val/call_accuracy", call_accuracy, step)
+        if not np.isnan(no_call_accuracy):
+            writer.add_scalar(
+                "val/no_call_accuracy", no_call_accuracy, step,
+            )
+        if not np.isnan(irrelevant_tool_accuracy):
+            writer.add_scalar(
+                "val/irrelevant_tool_accuracy",
+                irrelevant_tool_accuracy,
+                step,
+            )
         message = (
             f"  [val] step {step:5d} | exact call accuracy "
             f"{metrics['accuracy']:.4f} | name accuracy "
             f"{metrics['name_accuracy']:.4f}"
         )
+        if not np.isnan(no_call_accuracy):
+            message += (
+                f" | call accuracy {call_accuracy:.4f}"
+                f" | no-call accuracy {no_call_accuracy:.4f}"
+            )
     else:
         accuracy = gsm8k_eval.validate(
             policy,
@@ -421,12 +455,16 @@ def main():
 
         rollouts_text = tokenizer.batch_decode(rollouts, skip_special_tokens=True) # G
 
-        if args.dataset == "xlam-function-calling":
-            rewards = torch.tensor(
-                xlam_function_calling.tool_call_rewards(
-                    rollouts_text,
+        if args.dataset in XLAM_DATASETS:
+            reward_values = []
+            for rollout_text in rollouts_text:
+                _, _, reward_is_one = xlam_function_calling.tool_call_reward(
+                    rollout_text,
                     sample["answers"],
-                ),
+                )
+                reward_values.append(float(reward_is_one))
+            rewards = torch.tensor(
+                reward_values,
                 dtype=torch.float32,
                 device=rollouts.device,
             ) # [G]
