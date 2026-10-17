@@ -6,7 +6,6 @@ import random
 import subprocess
 import sys
 import time
-from collections import deque
 from datetime import UTC, datetime
 
 import numpy as np
@@ -23,6 +22,13 @@ XLAM_DATASETS = (
     "xlam-function-calling",
     "xlam-function-calling-irrelevance",
 )
+ROLLOUT_SAMPLING = {
+    "do_sample": True,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "repetition_penalty": 1.0,
+}
 
 
 def parse_args():
@@ -42,7 +48,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         choices=(*XLAM_DATASETS, "gsm8k"),
-        default="xlam-function-calling",
+        default="xlam-function-calling-irrelevance",
         help="GRPO dataset and matching verifiable reward",
     )
     parser.add_argument(
@@ -57,6 +63,10 @@ def parse_args():
     parser.add_argument(
         "--train-mode", choices=("lora", "full"), default="lora",
         help="Train LoRA parameters only, or all parameters of a dense model",
+    )
+    parser.add_argument(
+        "--xlam-reward", choices=("binary", "partial"), default="binary",
+        help="xLAM training reward; evaluation always uses binary exact correctness",
     )
 
     parser.add_argument("--group-size", type=int, default=4, help="Number of rollouts per prompt (G)")
@@ -74,11 +84,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization, data shuffle, and rollout sampling")
     parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from the selected training dataset")
     parser.add_argument("--max-prompt-len", type=int, default=640, help="Skip selected-dataset prompts longer than this")
+    parser.add_argument("--log-every", type=int, default=10, help="Write aggregated training metrics to TensorBoard every N steps")
     parser.add_argument("--eval-every", type=int, default=50, help="Validate every N steps after the initial validation (-1 to disable)")
     parser.add_argument("--eval-batch-size", type=int, default=8, help="Prompts generated together during validation")
 
     parser.add_argument("--tensorboard-dir", type=str, default="./runs/cuda/grpo", help="Base path for timestamped TensorBoard run directories")
-    parser.add_argument("--group-metric-window", type=int, default=100, help="Recent prompt groups in TensorBoard reward-outcome fractions")
 
     parser.add_argument("--save-every", type=int, default=100, help="Save a model checkpoint every N steps (0 to disable)")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/cuda/grpo", help="Base path for timestamped checkpoint directories")
@@ -86,8 +96,12 @@ def parse_args():
     args = parser.parse_args()
     if args.ppo_epochs < 1:
         parser.error("--ppo-epochs must be at least 1")
-    if args.group_metric_window < 1:
-        parser.error("--group-metric-window must be at least 1")
+    if args.log_every < 1:
+        parser.error("--log-every must be at least 1")
+    if args.group_size < 2:
+        parser.error("--group-size must be at least 2")
+    if args.epsilon <= 0:
+        parser.error("--epsilon must be positive")
     return args
 
 
@@ -219,9 +233,9 @@ def generate_rollouts(policy, prompt_tensor, group_size, max_new_tok, tokenizer)
             attention_mask=prompt_attention_mask,
             max_new_tokens=max_new_tok,
             num_return_sequences=group_size,
-            do_sample=True,
-            temperature=1.0,
-            top_p=1.0,
+            # Match the unmodified softmax distribution scored by token_logprobs.
+            # Override Qwen's inherited top-k and repetition penalty explicitly.
+            **ROLLOUT_SAMPLING,
             use_cache=True,
         )  # [G, P + L]
 
@@ -242,14 +256,19 @@ def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
     prompt_ids_extended = prompt_ids.repeat_interleave(rollouts.shape[0], dim=0)  # [G, P]
     complete_ids = torch.cat([prompt_ids_extended, rollouts], dim=-1)  # [G, P + L]
 
-    logits = model(complete_ids, use_cache=False).logits  # [G, P + L, V]
+    # Avoid materializing unused prompt logits on models that support this.
+    # The final prompt token predicts the first completion token.
+    model_kwargs = {}
+    if model._supports_logits_to_keep():
+        model_kwargs["logits_to_keep"] = rollouts.shape[1] + 1
+    logits = model(complete_ids, use_cache=False, **model_kwargs).logits
 
-    prompt_length = prompt_ids.shape[1]
+    # Take the completion predictors, excluding the last (out-of-scope) token.
+    # Negative indexing also handles models that return the full sequence.
+    logits_shift = logits[:, -(rollouts.shape[1] + 1):-1, :]  # [G, L, V]
 
-    # Get end of the prompt token. Since it predicts the first generated token. Don't take last token. It's out of scope.
-    logits_shift = logits[:, prompt_length - 1:-1, :]  # [G, L, V]
-
-    logprobs = torch.log_softmax(logits_shift, dim=-1)  # [G, L, V]
+    # Keep ratios and KL in float32 even when model logits are bfloat16.
+    logprobs = torch.log_softmax(logits_shift, dim=-1, dtype=torch.float32)  # [G, L, V]
 
     # Choose probabilities that corresponds to tokens in the rollout with fancy indexing.
     group_indices = torch.arange(rollouts.shape[0], device=rollouts.device).unsqueeze(-1)
@@ -262,6 +281,19 @@ def token_logprobs(model, prompt_ids, rollouts, rollout_masks):
     )
 
     return selected_logprobs_masked
+
+
+def group_advantages(rewards, epsilon):
+    """Standardize group rewards, giving constant groups exactly zero advantage."""
+    reward_std = rewards.std(correction=0)
+    mixed_group = rewards.max() > rewards.min()
+    # Repeated fractional rewards can have a rounded mean unequal to each
+    # element. Such constant groups must have exactly zero task advantage.
+    return torch.where(
+        mixed_group,
+        (rewards - rewards.mean()) / (reward_std + epsilon),
+        torch.zeros_like(rewards),
+    ) # [G]
 
 
 def validate_policy(policy, val_dataset, tokenizer, args, writer, step, progress=None):
@@ -347,6 +379,10 @@ def main():
     """
     args = parse_args()
     saved_args = vars(args).copy()
+    saved_args["rollout_sampling"] = ROLLOUT_SAMPLING.copy()
+    saved_args["reward_function"] = (
+        f"xlam_{args.xlam_reward}" if args.dataset in XLAM_DATASETS else "gsm8k_exact"
+    )
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
     run_name = f"grpo_{timestamp}"
     args.tensorboard_dir = os.path.join(
@@ -375,6 +411,8 @@ def main():
 
     print(f"Run directory: {args.tensorboard_dir}")
     print(f"Checkpoint directory: {args.checkpoint_dir}")
+    print(f"Training reward: {saved_args['reward_function']}")
+    print(f"Rollout sampling: {ROLLOUT_SAMPLING}")
 
     set_random_seed(args.seed)
     policy, reference, tokenizer = load_policy_and_reference(args)
@@ -419,8 +457,18 @@ def main():
     )
     completed_steps = 0
     training_start_time = time.monotonic()
-    # One prompt per step: aggregate group outcomes across steps for readable curves.
-    recent_group_rewards = deque(maxlen=args.group_metric_window)
+    log_step_count = 0
+    loss_sum_since_log = 0.0
+    reward_sum_since_log = 0.0
+    exact_reward_sum_since_log = 0.0
+    truncated_rollout_fraction_sum_since_log = 0.0
+    all_zero_group_count_since_log = 0
+    all_one_group_count_since_log = 0
+    mixed_group_count_since_log = 0
+    kl_sum_since_log = 0.0
+    gradient_norm_sum_since_log = 0.0
+    completion_tokens_sum_since_log = 0
+    elapsed_time_since_log = 0.0
 
     for step in range(total_steps):
         epoch_number, batch_offset = divmod(step, batches_per_epoch)
@@ -458,11 +506,18 @@ def main():
         if args.dataset in XLAM_DATASETS:
             reward_values = []
             for rollout_text in rollouts_text:
-                _, _, reward_is_one = xlam_function_calling.tool_call_reward(
-                    rollout_text,
-                    sample["answers"],
-                )
-                reward_values.append(float(reward_is_one))
+                if args.xlam_reward == "partial":
+                    reward = xlam_function_calling.partial_tool_call_reward(
+                        rollout_text,
+                        sample["answers"],
+                    )
+                else:
+                    _, _, reward_is_one = xlam_function_calling.tool_call_reward(
+                        rollout_text,
+                        sample["answers"],
+                    )
+                    reward = float(reward_is_one)
+                reward_values.append(reward)
             rewards = torch.tensor(
                 reward_values,
                 dtype=torch.float32,
@@ -478,7 +533,8 @@ def main():
                 device=rollouts.device,
             ) # [G]
 
-        advantage = (rewards - rewards.mean()) / (rewards.std(correction=0) + args.epsilon) # [G]
+        mixed_group = rewards.max() > rewards.min()
+        advantage = group_advantages(rewards, args.epsilon) # [G]
         advantage = advantage.unsqueeze(-1) # [G, 1]
 
         ppo_epoch_losses = []
@@ -505,7 +561,8 @@ def main():
 
             logprob_difference = reference_logprobs - new_logprobs # [G, L]
 
-            kl_loss = torch.exp(logprob_difference) - logprob_difference - 1 # [G, L]
+            # expm1 avoids subtracting nearly equal values when the policies agree.
+            kl_loss = torch.expm1(logprob_difference) - logprob_difference # [G, L]
 
             grpo_loss_inside = (-surrogate + args.kl_coef * kl_loss) * rollout_masks # [G, L]
 
@@ -534,48 +591,95 @@ def main():
             ppo_epoch_gradient_norms
         ).mean().float().item()
         mean_reward = rewards.mean().item()
-        reward_std = rewards.std(correction=0).item()
-        recent_group_rewards.append(mean_reward)
+        # Both reward variants reserve 1.0 for exact task correctness.
+        mean_exact_reward = rewards.eq(1.0).float().mean().item()
         truncated_rollout_fraction = truncated_rollouts.float().mean().item()
         completion_tokens = rollout_masks.sum().item()
-        tokens_per_second = completion_tokens / max(
-            time.time() - step_start_time,
-            1e-8,
-        )
+        step_elapsed_time = time.time() - step_start_time
 
-        writer.add_scalar("train/loss", mean_loss, completed_step)
-        writer.add_scalar("train/reward", mean_reward, completed_step)
-        writer.add_scalar("train/reward_std", reward_std, completed_step)
-        writer.add_scalar(
-            "train/truncated_rollout_fraction",
-            truncated_rollout_fraction,
-            completed_step,
-        )
-        writer.add_scalar(
-            "train/informative_group",
-            float(reward_std > 0.0),
-            completed_step,
-        )
-        if len(recent_group_rewards) == args.group_metric_window:
-            metric_prefix = f"train/group_fraction_{args.group_metric_window}"
-            all_wrong_fraction = recent_group_rewards.count(0.0) / args.group_metric_window
-            all_correct_fraction = recent_group_rewards.count(1.0) / args.group_metric_window
-            writer.add_scalar(f"{metric_prefix}/all_wrong", all_wrong_fraction, completed_step)
-            writer.add_scalar(f"{metric_prefix}/mixed", 1.0 - all_wrong_fraction - all_correct_fraction, completed_step)
-            writer.add_scalar(f"{metric_prefix}/all_correct", all_correct_fraction, completed_step)
-        writer.add_scalar("train/kl", mean_kl, completed_step)
-        writer.add_scalar("train/grad_norm", mean_gradient_norm, completed_step)
-        writer.add_scalar("train/learning_rate", args.lr, completed_step)
-        writer.add_scalar(
-            "train/completion_tokens",
-            completion_tokens,
-            completed_step,
-        )
-        writer.add_scalar(
-            "train/tokens_per_sec",
-            tokens_per_second,
-            completed_step,
-        )
+        log_step_count += 1
+        loss_sum_since_log += mean_loss
+        reward_sum_since_log += mean_reward
+        exact_reward_sum_since_log += mean_exact_reward
+        truncated_rollout_fraction_sum_since_log += truncated_rollout_fraction
+        all_zero_group_count_since_log += int(rewards.eq(0.0).all().item())
+        all_one_group_count_since_log += int(rewards.eq(1.0).all().item())
+        mixed_group_count_since_log += int(mixed_group.item())
+        kl_sum_since_log += mean_kl
+        gradient_norm_sum_since_log += mean_gradient_norm
+        completion_tokens_sum_since_log += completion_tokens
+        elapsed_time_since_log += step_elapsed_time
+
+        if completed_step % args.log_every == 0 or completed_step == total_steps:
+            writer.add_scalar(
+                "train/loss",
+                loss_sum_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar(
+                "train/reward",
+                reward_sum_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar(
+                "train/exact_reward",
+                exact_reward_sum_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar(
+                "train/truncated_rollout_fraction",
+                truncated_rollout_fraction_sum_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar(
+                "train/all_zero_group_fraction",
+                all_zero_group_count_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar(
+                "train/all_one_group_fraction",
+                all_one_group_count_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar(
+                "train/mixed_group_fraction",
+                mixed_group_count_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar(
+                "train/kl",
+                kl_sum_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar(
+                "train/grad_norm",
+                gradient_norm_sum_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar("train/learning_rate", args.lr, completed_step)
+            writer.add_scalar(
+                "train/completion_tokens",
+                completion_tokens_sum_since_log / log_step_count,
+                completed_step,
+            )
+            writer.add_scalar(
+                "train/tokens_per_sec",
+                completion_tokens_sum_since_log / max(elapsed_time_since_log, 1e-8),
+                completed_step,
+            )
+
+            log_step_count = 0
+            loss_sum_since_log = 0.0
+            reward_sum_since_log = 0.0
+            exact_reward_sum_since_log = 0.0
+            truncated_rollout_fraction_sum_since_log = 0.0
+            all_zero_group_count_since_log = 0
+            all_one_group_count_since_log = 0
+            mixed_group_count_since_log = 0
+            kl_sum_since_log = 0.0
+            gradient_norm_sum_since_log = 0.0
+            completion_tokens_sum_since_log = 0
+            elapsed_time_since_log = 0.0
 
         learning_rate_display = f"{optimizer.param_groups[0]['lr']:.3g}".replace("e-0", "e-")
         progress.set_description(

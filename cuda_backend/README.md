@@ -40,11 +40,10 @@ uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
   --dataset-path data/xlam-function-calling-irrelevance/test.jsonl
 ```
 
-SFT defaults to xLAM mixed with irrelevance examples. GRPO supports that same
-mixture with `--dataset xlam-function-calling-irrelevance`, or the original
-positive-only data with `--dataset xlam-function-calling`. Its binary reward
-checks exact tool-call sets for positive examples and correct abstention for
-irrelevance examples. Validation reports overall exact and function-name
+SFT and GRPO default to xLAM mixed with irrelevance examples. Select the
+original positive-only data with `--dataset xlam-function-calling`. The binary
+reward checks exact tool-call sets for positive examples and correct abstention
+for irrelevance examples. Validation reports overall exact and function-name
 accuracy plus separate call and no-call accuracy when applicable. Use
 `--dataset gsm8k` to select the original numeric-answer dataset and reward.
 
@@ -269,8 +268,8 @@ uv run --extra cuda -m cuda_backend.grpo_train \
 The mixed training file contains 56,753 call examples and 5,732 irrelevant-tool
 no-call examples. With the pinned Qwen tokenizer, the default 640-token prompt
 limit retains 43,928 calls and 4,863 no-calls before the seeded 5% runtime
-validation split. Overlong prompts are dropped whole. The binary reward uses
-the following contract:
+validation split. Overlong prompts are dropped whole. GRPO defaults to binary
+reward (`--xlam-reward binary`) with the following contract:
 
 - Predictions may contain Qwen-style `<tool_call>` blocks or a bare JSON
   object or list, optionally wrapped in a complete JSON code fence.
@@ -283,6 +282,17 @@ the following contract:
   A parsed call, attempted `<tool_call` tag, or other JSON-like attempted call
   receives 0.
 - There is no format, function-name, or partial-argument reward shaping.
+
+Partial credit remains available with `--xlam-reward partial`. Evaluation
+always measures binary exact correctness.
+
+TensorBoard logs `train/all_zero_group_fraction`,
+`train/all_one_group_fraction`, and `train/mixed_group_fraction` over each
+`--log-every` interval (10 prompt groups by default). These are fractions of
+groups, not individual completions or inner optimizer updates. They sum to 1
+for binary rewards. With partial rewards, constant groups strictly between 0
+and 1 fall outside all three categories. Counters reset after each log point;
+the final point includes any remaining steps using their actual group count.
 
 Use `--dataset xlam-function-calling` for the positive-only pool.
 

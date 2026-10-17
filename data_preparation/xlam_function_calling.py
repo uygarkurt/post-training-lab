@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 from datasets import load_dataset as hf_load_dataset
+from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 TRAIN_DATASET_PATH = (
@@ -416,7 +417,7 @@ def parse_tool_calls(completion_text):
 
 
 def _canonical_call(call):
-    """Serialize a call canonically while preserving JSON value types."""
+    """Serialize a call or argument value canonically, preserving JSON types."""
     return json.dumps(
         call,
         ensure_ascii=False,
@@ -458,6 +459,57 @@ def tool_call_reward(completion_text, reference_calls):
         _canonical_call(call) for call in predicted_calls
     ) == Counter(_canonical_call(call) for call in reference_calls)
     return predicted_calls, names_correct, calls_correct
+
+
+def partial_tool_call_reward(completion_text, reference_calls):
+    """Reward names, key sets, and individual values with one-to-one call matching."""
+    predicted_calls, names_correct, calls_correct = tool_call_reward(
+        completion_text,
+        reference_calls,
+    )
+
+    if not reference_calls:
+        return float(calls_correct)
+    if not names_correct:
+        return 0.0
+    if calls_correct:
+        return 1.0
+
+    # The complete name multiset must match: extra/missing/wrong calls earn 0.
+    # Per matched call: 0.4 for its name, 0.3 for all argument keys, and up to
+    # 0.3 for the fraction of correct top-level values (only with correct keys).
+    # Nested objects/arrays are compared exactly, preserving JSON value types.
+    call_scores = []
+    for predicted_call in predicted_calls:
+        scores = []
+        for reference_call in reference_calls:
+            score = 0.0
+            if predicted_call["name"] == reference_call["name"]:
+                score = 0.4
+                predicted_arguments = predicted_call["arguments"]
+                reference_arguments = reference_call["arguments"]
+                if predicted_arguments.keys() == reference_arguments.keys():
+                    correct_values = sum(
+                        _canonical_call(predicted_arguments[key])
+                        == _canonical_call(reference_arguments[key])
+                        for key in reference_arguments
+                    )
+                    value_fraction = (
+                        correct_values / len(reference_arguments)
+                        if reference_arguments else 1.0
+                    )
+                    score = 0.7 + 0.3 * value_fraction
+            scores.append(score)
+        call_scores.append(scores)
+
+    # Match repeated calls optimally, without reusing a prediction or reference.
+    predicted_indices, reference_indices = linear_sum_assignment(
+        call_scores, maximize=True,
+    )
+    return sum(
+        call_scores[predicted_index][reference_index]
+        for predicted_index, reference_index in zip(predicted_indices, reference_indices)
+    ) / len(reference_calls)
 
 
 def _make_eval_collate_fn(tokenizer):
