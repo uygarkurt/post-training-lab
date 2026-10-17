@@ -77,8 +77,6 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=10, help="Write training metrics to TensorBoard every N steps (loss averaged over response tokens)")
     parser.add_argument("--eval-every", type=int, default=50, help="Validate every N steps after the initial validation (-1 to disable)")
 
-    parser.add_argument("--tensorboard-dir", type=str, default="./runs/cuda/sft", help="Base path for timestamped TensorBoard run directories")
-
     parser.add_argument("--save-every", type=int, default=100, help="Save a model checkpoint every N steps (0 to disable)")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/cuda/sft", help="Base path for timestamped checkpoint directories")
 
@@ -274,31 +272,27 @@ def main():
     saved_args = vars(args).copy()
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
     run_name = f"sft_{timestamp}"
-    args.tensorboard_dir = os.path.join(
-        os.path.normpath(args.tensorboard_dir),
-        run_name,
-    )
     args.checkpoint_dir = os.path.join(
         os.path.normpath(args.checkpoint_dir),
         run_name,
     )
-    os.makedirs(args.tensorboard_dir)
-    os.makedirs(args.checkpoint_dir)
+    run_logs_dir = os.path.join(args.checkpoint_dir, "run_logs")
+    os.makedirs(run_logs_dir)
 
-    with open(os.path.join(args.tensorboard_dir, "args.json"), "w") as args_file:
+    with open(os.path.join(run_logs_dir, "args.json"), "w") as args_file:
         json.dump(saved_args, args_file, indent=2)
 
     terminal_columns = os.get_terminal_size(2).columns if os.isatty(2) else None
     terminal_stdout = os.dup(1)
     terminal_stderr = os.dup(2)
     tee_process = subprocess.Popen(
-        ["tee", os.path.join(args.tensorboard_dir, "out.log")],
+        ["tee", os.path.join(run_logs_dir, "out.log")],
         stdin=subprocess.PIPE,
     )
     os.dup2(tee_process.stdin.fileno(), 1)
     os.dup2(tee_process.stdin.fileno(), 2)
 
-    print(f"Run directory: {args.tensorboard_dir}")
+    print(f"Run logs directory: {run_logs_dir}")
     print(f"Checkpoint directory: {args.checkpoint_dir}")
 
     set_random_seed(args.seed)
@@ -333,8 +327,8 @@ def main():
         num_training_steps=args.num_iters,
         min_lr=args.min_lr,
     )
-    writer = SummaryWriter(log_dir=args.tensorboard_dir)
-    print(f"TensorBoard logs: tensorboard --logdir={args.tensorboard_dir}")
+    writer = SummaryWriter(log_dir=run_logs_dir)
+    print(f"TensorBoard logs: tensorboard --logdir={run_logs_dir}")
 
     if args.eval_every != -1:
         validation_loss = calculate_validation_loss(model, val_loader)

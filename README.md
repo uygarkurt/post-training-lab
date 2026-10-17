@@ -74,13 +74,15 @@ post-training-lab/
 ├── tutorials/
 │   ├── README.md
 │   └── grpo_minimal_pytorch.py # Self-contained minimal PyTorch GRPO
-├── checkpoints/             # Backend-qualified checkpoints (gitignored)
-└── runs/                    # Backend-qualified TensorBoard logs (gitignored)
+├── checkpoints/             # Checkpoints and CUDA run logs (gitignored)
+└── runs/                    # MLX run logs (gitignored)
 ```
 
-Training runs use `runs/<backend>/<algorithm>/<algorithm>_<timestamp>/` with
-matching checkpoints in
-`checkpoints/<backend>/<algorithm>/<algorithm>_<timestamp>/`.
+CUDA training runs keep `run_logs/` (arguments, terminal output, and TensorBoard
+events) beside step checkpoints in
+`checkpoints/cuda/<algorithm>/<algorithm>_<timestamp>/`. MLX runs use
+`runs/mlx/<algorithm>/<algorithm>_<timestamp>/` with matching checkpoints in
+`checkpoints/mlx/<algorithm>/<algorithm>_<timestamp>/`.
 
 Generate text or evaluate a PyTorch/CUDA checkpoint on the GSM8K test split:
 

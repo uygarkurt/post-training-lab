@@ -85,7 +85,7 @@ TensorBoard's `train/learning_rate` and each SFT checkpoint's `metadata.json`
 record the rate used for that step's optimizer update, before the scheduler
 advances. The final recorded rate can therefore be slightly above `--min-lr`.
 Each SFT and GRPO checkpoint stores only `step`, `elapsed_hours`, and
-`learning_rate` in `metadata.json`; the run's `args.json` records the training
+`learning_rate` in `metadata.json`; the run's `run_logs/args.json` records the training
 arguments. In both trainers, the elapsed timer starts immediately before the
 optimization loop, after initial validation. Loading an adapter starts a new
 optimizer; metadata does not provide full training-state resumption.
@@ -106,15 +106,14 @@ uv run --extra cuda -m cuda_backend.sft_train \
 
 ## Checkpoints and monitoring
 
-Runs are saved under `runs/cuda/<algorithm>/<algorithm>_<timestamp>/`, with
-matching checkpoints under
-`checkpoints/cuda/<algorithm>/<algorithm>_<timestamp>/`. Each run directory
-contains the parsed arguments, terminal output, and TensorBoard events.
+Runs are saved under `checkpoints/cuda/<algorithm>/<algorithm>_<timestamp>/`.
+Each run's `run_logs/` directory contains `args.json`, `out.log`, and
+TensorBoard events. Step checkpoints are saved alongside `run_logs/`.
 
 Monitor the metrics with:
 
 ```bash
-uv run --extra cuda tensorboard --logdir=./runs/cuda
+uv run --extra cuda tensorboard --logdir=./checkpoints/cuda
 ```
 
 SFT and GRPO train LoRA adapters by default. To continue SFT from an existing
