@@ -16,7 +16,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup
 
-from data_preparation import gsm8k, metamathqa, numinamath, xlam_function_calling
+from data_preparation import gsm8k, xlam_function_calling
 
 
 def parse_args():
@@ -37,8 +37,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         choices=(
-            "xlam-function-calling", "xlam-function-calling-irrelevance",
-            "metamathqa", "numinamath-algebra", "gsm8k",
+            "xlam-function-calling-irrelevance", "gsm8k",
         ),
         default="xlam-function-calling-irrelevance",
         help="SFT dataset to train on",
@@ -166,21 +165,10 @@ def load_model_and_tokenizer(args):
 
 def load_sft_datasets(tokenizer, args):
     """Load the selected SFT datasets and return their matching collator builder."""
-    dataset_kwargs = {}
-    if args.dataset in ("xlam-function-calling", "xlam-function-calling-irrelevance"):
-        print("Loading xLAM function-calling dataset ...")
+    if args.dataset == "xlam-function-calling-irrelevance":
+        print("Loading xLAM/irrelevance function-calling dataset ...")
         dataset_class = xlam_function_calling.XLAMFunctionCallingSFTDataset
         build_dataloader = xlam_function_calling.build_sft_dataloader
-        if args.dataset == "xlam-function-calling-irrelevance":
-            dataset_kwargs["dataset_path"] = xlam_function_calling.MIXED_TRAIN_DATASET_PATH
-    elif args.dataset == "metamathqa":
-        print("Loading MetaMathQA dataset ...")
-        dataset_class = metamathqa.MetaMathQASFTDataset
-        build_dataloader = metamathqa.build_sft_dataloader
-    elif args.dataset == "numinamath-algebra":
-        print("Loading NuminaMath Algebra dataset ...")
-        dataset_class = numinamath.NuminaMathSFTDataset
-        build_dataloader = numinamath.build_sft_dataloader
     else:
         print("Loading GSM8K dataset ...")
         dataset_class = gsm8k.GSM8KSFTDataset
@@ -192,7 +180,6 @@ def load_sft_datasets(tokenizer, args):
             max_seq_len=args.max_seq_len,
             seed=args.seed,
             debug_samples=args.debug_samples,
-            **dataset_kwargs,
         )
     else:
         train_dataset, val_dataset = dataset_class.build_train_val_datasets(
@@ -200,7 +187,6 @@ def load_sft_datasets(tokenizer, args):
             max_seq_len=args.max_seq_len,
             val_split=args.val_split,
             seed=args.seed,
-            **dataset_kwargs,
         )
 
     return train_dataset, val_dataset, build_dataloader

@@ -18,10 +18,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from cuda_backend import gsm8k_eval, xlam_function_calling_eval
 from data_preparation import gsm8k, xlam_function_calling
 
-XLAM_DATASETS = (
-    "xlam-function-calling",
-    "xlam-function-calling-irrelevance",
-)
 ROLLOUT_SAMPLING = {
     "do_sample": True,
     "temperature": 1.0,
@@ -47,7 +43,7 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset",
-        choices=(*XLAM_DATASETS, "gsm8k"),
+        choices=("xlam-function-calling-irrelevance", "gsm8k"),
         default="xlam-function-calling-irrelevance",
         help="GRPO dataset and matching verifiable reward",
     )
@@ -191,14 +187,9 @@ def load_policy_and_reference(args):
 
 def load_grpo_dataset(tokenizer, args):
     """Load the selected GRPO dataset with a deterministic runtime split."""
-    dataset_kwargs = {}
-    if args.dataset in XLAM_DATASETS:
-        print("Loading xLAM function-calling dataset ...")
+    if args.dataset == "xlam-function-calling-irrelevance":
+        print("Loading xLAM/irrelevance function-calling dataset ...")
         dataset_class = xlam_function_calling.XLAMFunctionCallingGRPODataset
-        if args.dataset == "xlam-function-calling-irrelevance":
-            dataset_kwargs["dataset_path"] = (
-                xlam_function_calling.MIXED_TRAIN_DATASET_PATH
-            )
     else:
         print("Loading GSM8K dataset ...")
         dataset_class = gsm8k.GSM8KGRPODataset
@@ -209,7 +200,6 @@ def load_grpo_dataset(tokenizer, args):
             max_prompt_len=args.max_prompt_len,
             seed=args.seed,
             debug_samples=args.debug_samples,
-            **dataset_kwargs,
         )
 
     return dataset_class.build_train_val_datasets(
@@ -217,7 +207,6 @@ def load_grpo_dataset(tokenizer, args):
         max_prompt_len=args.max_prompt_len,
         val_split=args.val_split,
         seed=args.seed,
-        **dataset_kwargs,
     )
 
 
@@ -296,7 +285,7 @@ def group_advantages(rewards, epsilon):
 
 def validate_policy(policy, val_dataset, tokenizer, args, writer, step, progress=None):
     """Run and log the validation metrics for the selected GRPO dataset."""
-    if args.dataset in XLAM_DATASETS:
+    if args.dataset == "xlam-function-calling-irrelevance":
         metrics = xlam_function_calling_eval.validate(
             policy,
             val_dataset,
@@ -379,7 +368,8 @@ def main():
     saved_args = vars(args).copy()
     saved_args["rollout_sampling"] = ROLLOUT_SAMPLING.copy()
     saved_args["reward_function"] = (
-        f"xlam_{args.xlam_reward}" if args.dataset in XLAM_DATASETS else "gsm8k_exact"
+        f"xlam_{args.xlam_reward}"
+        if args.dataset == "xlam-function-calling-irrelevance" else "gsm8k_exact"
     )
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
     run_name = f"grpo_{timestamp}"
@@ -497,7 +487,7 @@ def main():
 
         rollouts_text = tokenizer.batch_decode(rollouts, skip_special_tokens=True) # G
 
-        if args.dataset in XLAM_DATASETS:
+        if args.dataset == "xlam-function-calling-irrelevance":
             reward_values = []
             for rollout_text in rollouts_text:
                 if args.xlam_reward == "partial":

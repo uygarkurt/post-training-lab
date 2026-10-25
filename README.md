@@ -62,13 +62,9 @@ post-training-lab/
 │   ├── grpo_train.py
 │   ├── generate_text.py
 │   ├── gsm8k_eval.py
-│   ├── numinamath_eval.py
-│   ├── metamathqa_eval.py
 │   └── xlam_function_calling_eval.py
 ├── data_preparation/
 │   ├── gsm8k.py             # Shared samples, DataLoaders, and answer matching
-│   ├── numinamath.py
-│   ├── metamathqa.py
 │   ├── xlam_function_calling.py
 │   └── sft.py               # SFT padding and batching shared by all datasets
 ├── tutorials/
@@ -94,28 +90,10 @@ uv run --extra cuda -m cuda_backend.gsm8k_eval --model_path <checkpoint>
 Add `--load-adapter` when `<checkpoint>` is a PEFT adapter checkpoint. See the
 [CUDA backend documentation](cuda_backend/README.md) for complete examples.
 
-Evaluate on the local NuminaMath Algebra test set with the `eval` extra:
+Prepare the xLAM/irrelevance mixture and evaluate its local test split:
 
 ```bash
-uv run --extra cuda --extra eval -m cuda_backend.numinamath_eval --model_path <checkpoint>
-```
-
-Prepare MetaMathQA locally and evaluate its test split:
-
-```bash
-uv run --extra eval python data/metamathqa/prepare.py
-uv run --extra cuda --extra eval -m cuda_backend.metamathqa_eval --model_path <checkpoint>
-```
-
-Preparation deduplicates exact `query` matches by default and removes
-unparseable reference answers before splitting. Use
-`--keep-duplicate-queries` to retain repeated queries. See the
-[MetaMathQA data README](data/metamathqa/README.md) for split settings and evaluation options.
-
-Prepare xLAM function-calling data and evaluate its local test split:
-
-```bash
-uv run python data/xlam-function-calling-60k/prepare.py
+uv run python data/xlam-function-calling-irrelevance/prepare.py
 uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
   --model_path Qwen/Qwen2.5-0.5B-Instruct \
   --num-samples 100

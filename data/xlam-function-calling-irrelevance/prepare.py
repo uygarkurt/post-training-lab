@@ -1,7 +1,7 @@
-"""Prepare xLAM calls and irrelevant-tool abstentions for SFT."""
+"""Prepare xLAM calls and irrelevant-tool abstentions for SFT and GRPO."""
 
 import argparse
-import importlib.util
+import hashlib
 import json
 import math
 import platform
@@ -13,16 +13,201 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 
-XLAM_PREPARE_PATH = (
-    Path(__file__).resolve().parents[1] / "xlam-function-calling-60k/prepare.py"
-)
-XLAM_PREPARE_SPEC = importlib.util.spec_from_file_location("xlam_prepare", XLAM_PREPARE_PATH)
-xlam_prepare = importlib.util.module_from_spec(XLAM_PREPARE_SPEC)
-XLAM_PREPARE_SPEC.loader.exec_module(xlam_prepare)
+XLAM_DATASET = "lockon/xlam-function-calling-60k"
+XLAM_REVISION = "26d14ebfe18b1f7b524bd39b404b50af5dc97866"
+XLAM_SOURCE_FILE = "xlam_function_calling_60k.json"
 
 IRRELEVANCE_DATASET = "MadeAgents/xlam-irrelevance-7.5k"
 IRRELEVANCE_REVISION = "34323bf09efc7e4a394998a0fa91ff997617c369"
 IRRELEVANCE_SOURCE_FILE = "xlam-7.5k-irrelevancek.json"
+
+
+class DuplicateToolNameError(ValueError):
+    """Identify a row whose available functions do not have unique names."""
+
+
+def file_sha256(path):
+    """Hash a file without loading its contents into memory."""
+    with open(path, "rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def split_generic_arguments(arguments):
+    """Split comma-separated generic arguments without splitting nested types."""
+    parts = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(arguments):
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+        elif character == "," and depth == 0:
+            parts.append(arguments[start:index].strip())
+            start = index + 1
+    parts.append(arguments[start:].strip())
+    return [part for part in parts if part]
+
+
+def source_type_expression(source_type):
+    """Remove optional/default suffixes without cutting commas inside generics."""
+    return split_generic_arguments(source_type)[0]
+
+
+def json_schema_for_type(source_type):
+    """Map one Python-like xLAM type expression to a JSON Schema fragment."""
+    expression = source_type_expression(source_type)
+    lower_expression = expression.lower()
+    if lower_expression.startswith("list[") and expression.endswith("]"):
+        item_type = expression[5:-1]
+        return {"type": "array", "items": json_schema_for_type(item_type)}
+    if lower_expression.startswith("tuple[") and expression.endswith("]"):
+        tuple_types = split_generic_arguments(expression[6:-1])
+        return {
+            "type": "array",
+            "prefixItems": [json_schema_for_type(item) for item in tuple_types],
+            "minItems": len(tuple_types),
+            "maxItems": len(tuple_types),
+        }
+    if lower_expression.startswith("union[") and expression.endswith("]"):
+        union_types = split_generic_arguments(expression[6:-1])
+        return {"anyOf": [json_schema_for_type(item) for item in union_types]}
+    if lower_expression.startswith("str"):
+        return {"type": "string"}
+    if lower_expression.startswith("int"):
+        return {"type": "integer"}
+    if lower_expression.startswith("float"):
+        return {"type": "number"}
+    if lower_expression.startswith("bool"):
+        return {"type": "boolean"}
+    if lower_expression.startswith(("list", "tuple", "set")):
+        return {"type": "array"}
+    if lower_expression.startswith("dict"):
+        return {"type": "object"}
+    # Callable arguments in the source are represented as strings in JSON.
+    if lower_expression.startswith("callable"):
+        return {"type": "string"}
+    return {"type": "string"}
+
+
+def normalize_tool(tool):
+    """Convert one xLAM tool definition to Transformers' tool schema."""
+    if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+        raise ValueError("tool must contain a string name")
+    if not tool["name"].strip() or not isinstance(tool.get("parameters"), dict):
+        raise ValueError("tool name must be nonempty and parameters must be an object")
+
+    properties = {}
+    required = []
+    for parameter_name, parameter in tool["parameters"].items():
+        if not isinstance(parameter_name, str) or not isinstance(parameter, dict):
+            raise ValueError("tool parameters must map string names to objects")
+        source_type = parameter.get("type", "str")
+        if not isinstance(source_type, str):
+            raise ValueError("tool parameter type must be a string")
+
+        property_schema = json_schema_for_type(source_type)
+        description = parameter.get("description")
+        if isinstance(description, str) and description:
+            property_schema["description"] = description
+        if "default" in parameter:
+            property_schema["default"] = parameter["default"]
+        properties[parameter_name] = property_schema
+
+        optional = "optional" in source_type.lower() or "default" in parameter
+        if not optional:
+            required.append(parameter_name)
+
+    parameters = {"type": "object", "properties": properties}
+    if required:
+        parameters["required"] = required
+    function = {
+        "name": tool["name"],
+        "description": tool.get("description", ""),
+        "parameters": parameters,
+    }
+    return {"type": "function", "function": function}
+
+
+def normalize_row(row):
+    """Parse and validate one source row, returning its local representation."""
+    if not isinstance(row, dict) or not isinstance(row.get("id"), int):
+        raise ValueError("row must contain an integer id")
+    query = row.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a nonempty string")
+
+    tools = json.loads(row["tools"])
+    answers = json.loads(row["answers"])
+    if not isinstance(tools, list) or not tools:
+        raise ValueError("tools must decode to a nonempty list")
+    if not isinstance(answers, list) or not answers:
+        raise ValueError("answers must decode to a nonempty list")
+
+    normalized_tools = [normalize_tool(tool) for tool in tools]
+    tool_names = [tool["function"]["name"] for tool in normalized_tools]
+    if len(tool_names) != len(set(tool_names)):
+        raise DuplicateToolNameError("available tool names must be unique")
+    available_tool_names = set(tool_names)
+    available_parameters = {}
+    for tool in normalized_tools:
+        function = tool["function"]
+        available_parameters.setdefault(function["name"], set()).update(
+            function["parameters"]["properties"]
+        )
+    for answer in answers:
+        if (
+            not isinstance(answer, dict)
+            or not isinstance(answer.get("name"), str)
+            or not answer["name"].strip()
+            or not isinstance(answer.get("arguments"), dict)
+        ):
+            raise ValueError("each answer must contain a name and argument object")
+        if answer["name"] not in available_tool_names:
+            raise ValueError("answer names a tool that is not available")
+        if not set(answer["arguments"]).issubset(
+            available_parameters[answer["name"]]
+        ):
+            raise ValueError("answer contains an argument absent from its tool")
+
+    return {
+        "id": row["id"],
+        "query": query,
+        # Keep nested, heterogeneous objects encoded so Hugging Face Datasets
+        # does not infer one enormous struct from every parameter name.
+        "tools": json.dumps(
+            normalized_tools, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "answers": json.dumps(
+            answers, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ),
+    }
+
+
+def split_rows(rows, test_fraction, seed):
+    """Shuffle and split rows without separating whitespace-equal queries."""
+    query_groups = {}
+    for row in rows:
+        query_key = " ".join(row["query"].split())
+        query_groups.setdefault(query_key, []).append(row)
+
+    groups = list(query_groups.values())
+    generator = random.Random(seed)
+    generator.shuffle(groups)
+    target_test_rows = math.ceil(len(rows) * test_fraction)
+    train_rows, test_rows = [], []
+    for group in groups:
+        if len(test_rows) + len(group) <= target_test_rows:
+            test_rows.extend(group)
+        else:
+            train_rows.extend(group)
+    if len(test_rows) != target_test_rows:
+        raise ValueError("Cannot reach the test size without splitting duplicate queries")
+
+    generator.shuffle(train_rows)
+    generator.shuffle(test_rows)
+    return train_rows, test_rows, len(query_groups)
 
 
 def query_key(row):
@@ -44,10 +229,10 @@ def normalize_irrelevance_row(row, index):
     if not tools:
         return None
 
-    normalized_tools = [xlam_prepare.normalize_tool(tool) for tool in tools]
+    normalized_tools = [normalize_tool(tool) for tool in tools]
     tool_names = [tool["function"]["name"] for tool in normalized_tools]
     if len(tool_names) != len(set(tool_names)):
-        raise xlam_prepare.DuplicateToolNameError(
+        raise DuplicateToolNameError(
             "available tool names must be unique"
         )
     return {
@@ -91,10 +276,10 @@ def main():
     xlam_source_path = args.xlam_source_file
     if xlam_source_path is None:
         xlam_source_path = Path(hf_hub_download(
-            repo_id=xlam_prepare.DATASET,
+            repo_id=XLAM_DATASET,
             repo_type="dataset",
-            revision=xlam_prepare.DATASET_REVISION,
-            filename=xlam_prepare.SOURCE_FILE,
+            revision=XLAM_REVISION,
+            filename=XLAM_SOURCE_FILE,
         ))
     irrelevance_source_path = args.irrelevance_source_file
     if irrelevance_source_path is None:
@@ -118,8 +303,8 @@ def main():
     invalid_counts = defaultdict(int)
     for row in xlam_source_rows:
         try:
-            normalized = xlam_prepare.normalize_row(row)
-        except xlam_prepare.DuplicateToolNameError:
+            normalized = normalize_row(row)
+        except DuplicateToolNameError:
             invalid_counts["xlam_duplicate_tool_names"] += 1
             continue
         except (KeyError, TypeError, ValueError):
@@ -131,7 +316,7 @@ def main():
     for index, row in enumerate(irrelevance_source_rows):
         try:
             normalized = normalize_irrelevance_row(row, index)
-        except xlam_prepare.DuplicateToolNameError:
+        except DuplicateToolNameError:
             invalid_counts["irrelevance_duplicate_tool_names"] += 1
             continue
         except (KeyError, TypeError, ValueError):
@@ -145,7 +330,7 @@ def main():
     if not xlam_rows or not irrelevance_rows:
         raise ValueError("Both sources must retain at least one valid row")
 
-    xlam_train, xlam_test, xlam_query_groups = xlam_prepare.split_rows(
+    xlam_train, xlam_test, xlam_query_groups = split_rows(
         xlam_rows, test_fraction=args.test_fraction, seed=args.seed,
     )
     train_queries = {query_key(row) for row in xlam_train}
@@ -188,21 +373,21 @@ def main():
                 output.write(json.dumps(
                     row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
                 ) + "\n")
-        output_hashes[path.name] = xlam_prepare.file_sha256(path)
+        output_hashes[path.name] = file_sha256(path)
 
     manifest = {
         "sources": {
             "xlam": {
-                "dataset": xlam_prepare.DATASET,
+                "dataset": XLAM_DATASET,
                 "revision": (
-                    xlam_prepare.DATASET_REVISION
+                    XLAM_REVISION
                     if args.xlam_source_file is None else None
                 ),
                 "source_file": (
                     str(xlam_source_path)
-                    if args.xlam_source_file else xlam_prepare.SOURCE_FILE
+                    if args.xlam_source_file else XLAM_SOURCE_FILE
                 ),
-                "source_sha256": xlam_prepare.file_sha256(xlam_source_path),
+                "source_sha256": file_sha256(xlam_source_path),
                 "source_rows": len(xlam_source_rows),
                 "retained_rows": len(xlam_rows),
                 "train_rows": len(xlam_train),
@@ -215,7 +400,7 @@ def main():
                     str(irrelevance_source_path)
                     if args.irrelevance_source_file else IRRELEVANCE_SOURCE_FILE
                 ),
-                "source_sha256": xlam_prepare.file_sha256(irrelevance_source_path),
+                "source_sha256": file_sha256(irrelevance_source_path),
                 "source_rows": len(irrelevance_source_rows),
                 "no_tool_rows_excluded": no_tool_rows_excluded,
                 "retained_rows": len(irrelevance_rows),
@@ -237,8 +422,7 @@ def main():
         "train_rows": len(train_rows),
         "test_rows": len(test_rows),
         "sha256": output_hashes,
-        "prepare_script_sha256": xlam_prepare.file_sha256(__file__),
-        "xlam_prepare_script_sha256": xlam_prepare.file_sha256(XLAM_PREPARE_PATH),
+        "prepare_script_sha256": file_sha256(__file__),
         "python_version": platform.python_version(),
         "package_versions": {"huggingface-hub": version("huggingface-hub")},
     }

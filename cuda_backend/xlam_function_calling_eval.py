@@ -1,4 +1,4 @@
-"""xLAM function-calling evaluation for CUDA models."""
+"""xLAM/irrelevance function-calling evaluation for CUDA models."""
 
 import argparse
 import json
@@ -158,9 +158,9 @@ def validate(
 
 
 def main():
-    """Load a CUDA checkpoint and evaluate it on the local xLAM test split."""
+    """Load a CUDA checkpoint and evaluate it on the local mixed xLAM test split."""
     parser = argparse.ArgumentParser(
-        description="Evaluate a CUDA model on the xLAM function-calling test split.",
+        description="Evaluate a CUDA model on the xLAM/irrelevance test split.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -178,7 +178,7 @@ def main():
         "--dataset-path",
         type=str,
         default=str(xlam_function_calling.TEST_DATASET_PATH),
-        help="Path to a prepared local xLAM test JSONL file",
+        help="Path to a prepared local xLAM/irrelevance test JSONL file",
     )
     parser.add_argument(
         "--max-prompt-len",
@@ -221,7 +221,7 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print("Loading xLAM function-calling test split ...")
+    print("Loading xLAM/irrelevance function-calling test split ...")
     test_dataset = xlam_function_calling.XLAMFunctionCallingEvalDataset(
         tokenizer,
         max_prompt_len=args.max_prompt_len,

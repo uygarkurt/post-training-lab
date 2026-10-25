@@ -1,4 +1,4 @@
-"""Local xLAM function-calling SFT/GRPO data, rewards, and evaluation."""
+"""Local xLAM/irrelevance SFT/GRPO data, rewards, and evaluation."""
 
 import json
 import re
@@ -12,13 +12,10 @@ from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 TRAIN_DATASET_PATH = (
     Path(__file__).resolve().parents[1]
-    / "data/xlam-function-calling-60k/train.jsonl"
-)
-TEST_DATASET_PATH = TRAIN_DATASET_PATH.with_name("test.jsonl")
-MIXED_TRAIN_DATASET_PATH = (
-    Path(__file__).resolve().parents[1]
     / "data/xlam-function-calling-irrelevance/train.jsonl"
 )
+TEST_DATASET_PATH = TRAIN_DATASET_PATH.with_name("test.jsonl")
+MIXED_TRAIN_DATASET_PATH = TRAIN_DATASET_PATH
 TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 
 

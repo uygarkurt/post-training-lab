@@ -1,6 +1,10 @@
 __pycache__/
 runs/
 checkpoints/
+/cuda_backend/metamathqa_eval.py
+/cuda_backend/numinamath_eval.py
+/data_preparation/metamathqa.py
+/data_preparation/numinamath.py
 experiments/*
 .agents/local/
 .venv/
