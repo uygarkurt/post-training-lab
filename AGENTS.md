@@ -6,19 +6,6 @@ This repository is a minimal, hackable implementation of the full LLM
 post-training pipeline. It is primarily an educational and experimentation
 codebase.
 
-## Local research context
-
-- Before handling each user request, read all Markdown files under
-  `.agents/local/` if that directory exists.
-- Treat these files as private, mutable context for the current research and
-  experiments, in addition to the guidance in this file.
-- Re-read them for each request because the experimental plan may change
-  during a session.
-- Distinguish established research goals from provisional parameters and
-  assumptions as marked in those files.
-- Do not modify files under `.agents/local/` unless the user asks.
-- If the directory is absent or empty, continue without mentioning it.
-
 ## Design priorities
 
 When making changes, prioritize:
