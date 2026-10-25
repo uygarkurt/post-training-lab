@@ -7,10 +7,6 @@ experiments/*
 .DS_Store
 notes.md
 data/*
-!data/metamathqa/
-data/metamathqa/*
-!data/metamathqa/prepare.py
-!data/metamathqa/README.md
 !data/xlam-function-calling-irrelevance/
 data/xlam-function-calling-irrelevance/*
 !data/xlam-function-calling-irrelevance/prepare.py
