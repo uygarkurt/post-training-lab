@@ -29,6 +29,18 @@ Apple M4 chip.
 | SFT | ✅ | ✅ |
 | GRPO | ✅ | ✅ |
 
+## Supported tasks
+
+Support below includes SFT, GRPO, and evaluation.
+
+| Task | Dataset | MLX (Apple Silicon) | PyTorch (CUDA) |
+| ---- | ------- | ------------------- | -------------- |
+| Math reasoning (GSM8K) | `gsm8k` | ✅ | ✅ |
+| Tool calling (xLAM) | `xlam-tool-calling-mixed` | — | ✅ |
+
+Select a task in CUDA SFT and GRPO with `--dataset gsm8k` (default) or
+`--dataset xlam-tool-calling-mixed`.
+
 ## Tutorials
 
 Each tutorial is a self-contained implementation that can be read and changed
