@@ -1,0 +1,4 @@
+interface:
+  display_name: "Convert CUDA to MLX"
+  short_description: "Mirror CUDA algorithms in MLX with matching CLI and flow"
+  default_prompt: "Use $convert-cuda-to-mlx to convert a CUDA algorithm into its matching MLX implementation, replacing any existing counterpart and preserving arguments, defaults, math, and flow."
