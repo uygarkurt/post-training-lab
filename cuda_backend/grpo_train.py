@@ -60,10 +60,6 @@ def parse_args():
         "--train-mode", choices=("lora", "full"), default="lora",
         help="Train LoRA parameters only, or all parameters of a dense model",
     )
-    parser.add_argument(
-        "--xlam-reward", choices=("binary", "partial"), default="binary",
-        help="xLAM training reward; evaluation always uses binary exact correctness",
-    )
 
     parser.add_argument("--group-size", type=int, default=4, help="Number of rollouts per prompt (G)")
     parser.add_argument("--max-new-tok", type=int, default=256, help="Max tokens to generate per rollout")
@@ -368,7 +364,7 @@ def main():
     saved_args = vars(args).copy()
     saved_args["rollout_sampling"] = ROLLOUT_SAMPLING.copy()
     saved_args["reward_function"] = (
-        f"xlam_{args.xlam_reward}"
+        "xlam_binary"
         if args.dataset == "xlam-function-calling-irrelevance" else "gsm8k_exact"
     )
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
@@ -490,18 +486,11 @@ def main():
         if args.dataset == "xlam-function-calling-irrelevance":
             reward_values = []
             for rollout_text in rollouts_text:
-                if args.xlam_reward == "partial":
-                    reward = xlam_function_calling.partial_tool_call_reward(
-                        rollout_text,
-                        sample["answers"],
-                    )
-                else:
-                    _, _, reward_is_one = xlam_function_calling.tool_call_reward(
-                        rollout_text,
-                        sample["answers"],
-                    )
-                    reward = float(reward_is_one)
-                reward_values.append(reward)
+                _, _, reward_is_one = xlam_function_calling.tool_call_reward(
+                    rollout_text,
+                    sample["answers"],
+                )
+                reward_values.append(float(reward_is_one))
             rewards = torch.tensor(
                 reward_values,
                 dtype=torch.float32,

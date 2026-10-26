@@ -187,8 +187,8 @@ uv run --extra cuda -m cuda_backend.grpo_train \
 The mixed training split contains 56,753 call examples and 5,732 irrelevant-tool
 no-call examples. With the pinned Qwen tokenizer, the default 640-token prompt
 limit retains 43,928 calls and 4,863 no-calls before the seeded 5% runtime
-validation split. Overlong prompts are dropped whole. GRPO defaults to binary
-reward (`--xlam-reward binary`) with the following contract:
+validation split. Overlong prompts are dropped whole. GRPO uses a binary
+reward with the following contract:
 
 - Predictions may contain Qwen-style `<tool_call>` blocks or a bare JSON
   object or list, optionally wrapped in a complete JSON code fence.
@@ -202,16 +202,14 @@ reward (`--xlam-reward binary`) with the following contract:
   receives 0.
 - There is no format, function-name, or partial-argument reward shaping.
 
-Partial credit remains available with `--xlam-reward partial`. Evaluation
-always measures binary exact correctness.
+Training and evaluation use the same binary exact correctness reward.
 
 TensorBoard logs `train/all_zero_group_fraction`,
 `train/all_one_group_fraction`, and `train/mixed_group_fraction` over each
 `--log-every` interval (10 prompt groups by default). These are fractions of
-groups, not individual completions or inner optimizer updates. They sum to 1
-for binary rewards. With partial rewards, constant groups strictly between 0
-and 1 fall outside all three categories. Counters reset after each log point;
-the final point includes any remaining steps using their actual group count.
+groups, not individual completions or inner optimizer updates. They sum to 1.
+Counters reset after each log point; the final point includes any remaining
+steps using their actual group count.
 
 ## Entrypoints
 

@@ -10,7 +10,6 @@ keywords = ["post-training", "sft", "grpo", "rlhf", "lora", "mlx"]
 dependencies = [
     "datasets>=4.8.4",
     "numpy>=2.0",
-    "scipy>=1.18.1",
     "tensorboard>=2.20.0",
     "tensorboardx>=2.6.5",
     "torch>=2.11.0",
