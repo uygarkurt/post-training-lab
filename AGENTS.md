@@ -21,19 +21,36 @@ multiple abstraction layers.
 
 ## Implementation rules
 
-- Preserve the self-contained nature of the training scripts.
-- Prefer explicit code over framework-like abstractions.
+- Keep training scripts self-contained in their algorithm flow; use library
+  utilities directly for supporting functionality.
+- Implement core post-training logic in the training scripts, including
+  losses, rewards, advantages, and algorithm-specific update steps. Prefer
+  explicit code over frameworks that hide this logic.
+- For all supporting functionality, use an existing implementation when it
+  meets the requirements. This applies throughout the project, including
+  dataset loading and processing, tokenization, splitting, padding, batching,
+  optimizers, learning-rate schedules, logging, and serialization.
+- Before writing a helper, check the repository, standard library, and
+  relevant libraries for an implementation to reuse. Prefer direct calls to
+  existing APIs and minimal glue code; do not reimplement available behavior
+  or add wrappers that merely forward calls.
+- Write custom supporting code only when existing implementations cannot meet
+  the requirements. Keep it limited to the missing behavior and briefly
+  explain the concrete limitation that requires it.
 - Avoid introducing classes, registries, factories, configuration frameworks,
   or extra modules unless they remove substantial unavoidable complexity.
 - Do not deduplicate code when doing so would make an individual algorithm
   harder to understand in isolation.
-- Keep the mathematical and algorithmic steps of every post-training method
-  visible in its training script.
+- Keep the core mathematical and algorithmic steps of every post-training
+  method visible in its training script, using existing tensor operations and
+  primitives.
 - Use descriptive variable names, especially for losses, rewards, advantages,
   masks, token probabilities, and other algorithm-specific quantities.
 - Do not add Python type annotations to function or method signatures.
 - Give every new function and class a concise docstring describing its purpose.
-- Keep new dependencies to a minimum.
+- Prefer existing dependencies. Add a focused dependency when it avoids
+  substantial custom supporting code; minimizing dependencies is not a reason
+  to reimplement suitable library functionality.
 - Make the smallest change that satisfies the request.
 - Preserve hackability: changing an algorithm, loss, reward, dataset, or model
   backend should remain straightforward.
@@ -60,18 +77,20 @@ multiple abstraction layers.
 - Keep MLX tensor conversion, devices, model operations, losses, and
   optimization in `mlx_backend/`; keep their CUDA equivalents in
   `cuda_backend/`.
-- Implement new algorithms and major algorithm changes in CUDA first, then
-  mirror them in MLX without changing the shared data contract.
+- Implement new algorithms and major algorithm changes in CUDA first.
+- Mirror changes to MLX only when explicitly requested by the user. Changes
+  to CUDA do not require corresponding MLX edits. When mirroring, preserve
+  the shared data contract.
 - Treat established variable names in `cuda_backend/` as canonical for shared
   LLM-training concepts. Before introducing a variable, search the existing
   CUDA implementations for the same value and reuse its name when the
-  semantics match; carry that name into corresponding MLX implementations.
+  semantics match; carry that name into MLX when mirroring is requested.
   Introduce a different name only when the value has genuinely different
   semantics, and keep that difference explicit.
-- Keep corresponding backend filenames, CLI options, section order, variable
-  names, and mathematical steps aligned where practical.
-- Prefer structural parity over literal line-for-line identity. Use native
-  PyTorch and MLX operations when that makes each implementation clearer.
+- When mirroring is requested, keep corresponding backend filenames, CLI
+  options, section order, variable names, and mathematical steps aligned where
+  practical. Prefer structural parity over literal line-for-line identity,
+  using native PyTorch and MLX operations where they are clearer.
 - Do not change shared data code solely to accommodate one backend.
 
 ## CUDA training script consistency
@@ -108,3 +127,4 @@ multiple abstraction layers.
 - Prefer debug or smoke-test configurations when runtime validation is needed.
 - State clearly when backend-specific execution could not be tested on the
   current hardware.
+  
