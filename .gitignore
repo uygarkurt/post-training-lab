@@ -10,11 +10,7 @@ experiments/*
 .venv/
 .DS_Store
 notes.md
-data/*
-!data/xlam-function-calling-irrelevance/
-data/xlam-function-calling-irrelevance/*
-!data/xlam-function-calling-irrelevance/prepare.py
-!data/xlam-function-calling-irrelevance/README.md
+/data/
 !experiments/scripts/
 experiments/scripts/*
 !experiments/scripts/evaluate_checkpoints.py
