@@ -147,7 +147,7 @@ Omit `--load-adapter` when loading a Hugging Face model or dense checkpoint.
 - `grpo_train.py` — group-relative policy optimization with LoRA or full-model training
 - `generate_text.py` — inference from a base model, dense checkpoint, or PEFT adapter
 - `gsm8k_eval.py` — greedy GSM8K test-set evaluation
-- `xlam_function_calling_eval.py` — exact tool-call evaluation on the local xLAM test set
+- `xlam_function_calling_eval.py` — exact tool-call evaluation on the xLAM test set
 
 Dataset loading, tokenization, splitting, PyTorch DataLoaders, padding, and
 answer matching come from `data_preparation/gsm8k.py`,

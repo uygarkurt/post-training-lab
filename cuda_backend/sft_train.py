@@ -14,8 +14,9 @@ from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup
 
-from data_preparation import gsm8k
+from data_preparation import gsm8k, xlam_function_calling
 
 
 def parse_args():
@@ -27,15 +28,23 @@ def parse_args():
 
     parser.add_argument(
         "--debug", action="store_true",
-        help="Overfit a tiny GSM8K subset (same samples for train and val)",
+        help="Overfit a tiny subset (same samples for train and val)",
     )
     parser.add_argument(
         "--debug-samples", type=int, default=8,
-        help="Number of GSM8K samples in --debug mode (train and val use the same set)",
+        help="Number of samples in --debug mode (train and val use the same set)",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=(
+            "xlam-tool-calling-mixed", "gsm8k",
+        ),
+        default="gsm8k",
+        help="SFT dataset to train on",
     )
     parser.add_argument(
         "--model", type=str,
-        default="Qwen/Qwen2-0.5B-Instruct",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
         help="Hugging Face base model, merged model, or local model directory",
     )
     parser.add_argument(
@@ -54,37 +63,32 @@ def parse_args():
         default=512,
         help="Maximum tokenized sample length",
     )
-    parser.add_argument("--lr", type=float, default=5e-5, help="AdamW learning rate")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Peak AdamW learning rate for cosine scheduling")
     parser.add_argument("--num-iters", type=int, default=500, help="Number of optimizer steps")
+    parser.add_argument("--warmup-steps", type=int, default=200, help="Steps to linearly increase the learning rate to --lr (0 disables warmup)")
+    parser.add_argument("--min-lr", type=float, default=5e-6, help="Minimum learning rate at the end of the cosine schedule")
 
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank (r)")
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha (scale = alpha / rank)")
 
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization and data shuffling")
-    parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from GSM8K train set")
-    parser.add_argument("--max-prompt-len", type=int, default=512, help="Skip GSM8K prompts longer than this")
+    parser.add_argument("--val-split", type=float, default=0.05, help="Fraction held out from the training dataset")
+    parser.add_argument("--log-every", type=int, default=10, help="Write training metrics to TensorBoard every N steps (loss averaged over response tokens)")
     parser.add_argument("--eval-every", type=int, default=50, help="Validate every N steps after the initial validation (-1 to disable)")
-
-    parser.add_argument("--tensorboard-dir", type=str, default="./runs/cuda/sft", help="Base path for timestamped TensorBoard run directories")
 
     parser.add_argument("--save-every", type=int, default=100, help="Save a model checkpoint every N steps (0 to disable)")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/cuda/sft", help="Base path for timestamped checkpoint directories")
 
     args = parser.parse_args()
-    if args.batch_size < 1:
-        parser.error("--batch-size must be at least 1")
-    if args.debug_samples < 1:
-        parser.error("--debug-samples must be at least 1")
+    # The scheduler accepts some combinations that silently change its behavior.
     if args.num_iters < 1:
         parser.error("--num-iters must be at least 1")
-    if args.max_seq_len < 2:
-        parser.error("--max-seq-len must be at least 2")
-    if args.max_prompt_len < 1:
-        parser.error("--max-prompt-len must be at least 1")
-    if not 0.0 < args.val_split < 1.0:
-        parser.error("--val-split must be between 0 and 1")
-    if args.lora_rank < 1:
-        parser.error("--lora-rank must be at least 1")
+    if not 0 <= args.warmup_steps < args.num_iters:
+        parser.error("--warmup-steps must be at least 0 and less than --num-iters")
+    if not np.isfinite(args.lr) or args.lr <= 0:
+        parser.error("--lr must be finite and greater than 0")
+    if not 0 <= args.min_lr <= args.lr:
+        parser.error("--min-lr must be between 0 and --lr")
     return args
 
 
@@ -159,6 +163,35 @@ def load_model_and_tokenizer(args):
     return model, tokenizer
 
 
+def load_sft_datasets(tokenizer, args):
+    """Load the selected SFT datasets and return their matching collator builder."""
+    if args.dataset == "xlam-tool-calling-mixed":
+        print("Loading xlam-tool-calling-mixed dataset ...")
+        dataset_class = xlam_function_calling.XLAMFunctionCallingSFTDataset
+        build_dataloader = xlam_function_calling.build_sft_dataloader
+    else:
+        print("Loading GSM8K dataset ...")
+        dataset_class = gsm8k.GSM8KSFTDataset
+        build_dataloader = gsm8k.build_sft_dataloader
+
+    if args.debug:
+        train_dataset, val_dataset = dataset_class.build_debug_overfit_datasets(
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            seed=args.seed,
+            debug_samples=args.debug_samples,
+        )
+    else:
+        train_dataset, val_dataset = dataset_class.build_train_val_datasets(
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            val_split=args.val_split,
+            seed=args.seed,
+        )
+
+    return train_dataset, val_dataset, build_dataloader
+
+
 @torch.inference_mode()
 def calculate_validation_loss(model, val_loader):
     """Return response-token-weighted loss over the validation loader."""
@@ -202,11 +235,20 @@ def calculate_validation_loss(model, val_loader):
     return total_loss / total_response_token_count
 
 
-def save_checkpoint(model, tokenizer, checkpoint_dir, step):
-    """Save a full model or PEFT adapter and tokenizer for one step."""
+def save_checkpoint(
+    model, tokenizer, checkpoint_dir, step, training_start_time, learning_rate,
+):
+    """Save weights, tokenizer, elapsed hours, and the last update's learning rate."""
     checkpoint_path = os.path.join(checkpoint_dir, f"step_{step:06d}")
     model.save_pretrained(checkpoint_path)
     tokenizer.save_pretrained(checkpoint_path)
+    metadata = {
+        "step": step,
+        "elapsed_hours": (time.monotonic() - training_start_time) / 3600,
+        "learning_rate": learning_rate,
+    }
+    with open(os.path.join(checkpoint_path, "metadata.json"), "w") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
     print(f"  [ckpt] step {step:5d} -> {checkpoint_path}")
 
 
@@ -216,65 +258,44 @@ def main():
     saved_args = vars(args).copy()
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
     run_name = f"sft_{timestamp}"
-    args.tensorboard_dir = os.path.join(
-        os.path.normpath(args.tensorboard_dir),
-        run_name,
-    )
     args.checkpoint_dir = os.path.join(
         os.path.normpath(args.checkpoint_dir),
         run_name,
     )
-    os.makedirs(args.tensorboard_dir)
-    os.makedirs(args.checkpoint_dir)
+    run_logs_dir = os.path.join(args.checkpoint_dir, "run_logs")
+    os.makedirs(run_logs_dir)
 
-    with open(os.path.join(args.tensorboard_dir, "args.json"), "w") as args_file:
+    with open(os.path.join(run_logs_dir, "args.json"), "w") as args_file:
         json.dump(saved_args, args_file, indent=2)
 
     terminal_columns = os.get_terminal_size(2).columns if os.isatty(2) else None
     terminal_stdout = os.dup(1)
     terminal_stderr = os.dup(2)
     tee_process = subprocess.Popen(
-        ["tee", os.path.join(args.tensorboard_dir, "out.log")],
+        ["tee", os.path.join(run_logs_dir, "out.log")],
         stdin=subprocess.PIPE,
     )
     os.dup2(tee_process.stdin.fileno(), 1)
     os.dup2(tee_process.stdin.fileno(), 2)
 
-    print(f"Run directory: {args.tensorboard_dir}")
+    print(f"Run logs directory: {run_logs_dir}")
     print(f"Checkpoint directory: {args.checkpoint_dir}")
 
     set_random_seed(args.seed)
     model, tokenizer = load_model_and_tokenizer(args)
 
-    print("Loading GSM8K dataset ...")
-    if args.debug:
-        train_dataset, val_dataset = (
-            gsm8k.GSM8KSFTDataset.build_debug_overfit_datasets(
-                tokenizer,
-                max_seq_len=args.max_seq_len,
-                max_prompt_len=args.max_prompt_len,
-                seed=args.seed,
-                debug_samples=args.debug_samples,
-            )
-        )
-    else:
-        train_dataset, val_dataset = (
-            gsm8k.GSM8KSFTDataset.build_train_val_datasets(
-                tokenizer,
-                max_seq_len=args.max_seq_len,
-                max_prompt_len=args.max_prompt_len,
-                val_split=args.val_split,
-                seed=args.seed,
-            )
-        )
-    train_loader = gsm8k.build_sft_dataloader(
+    train_dataset, val_dataset, build_dataloader = load_sft_datasets(
+        tokenizer,
+        args,
+    )
+    train_loader = build_dataloader(
         train_dataset,
         tokenizer,
         batch_size=args.batch_size,
         shuffle=True,
         seed=args.seed,
     )
-    val_loader = gsm8k.build_sft_dataloader(
+    val_loader = build_dataloader(
         val_dataset,
         tokenizer,
         batch_size=args.batch_size,
@@ -286,8 +307,14 @@ def main():
         if parameter.requires_grad
     ]
     optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr)
-    writer = SummaryWriter(log_dir=args.tensorboard_dir)
-    print(f"TensorBoard logs: tensorboard --logdir={args.tensorboard_dir}")
+    scheduler = get_cosine_with_min_lr_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=args.num_iters,
+        min_lr=args.min_lr,
+    )
+    writer = SummaryWriter(log_dir=run_logs_dir)
+    print(f"TensorBoard logs: tensorboard --logdir={run_logs_dir}")
 
     if args.eval_every != -1:
         validation_loss = calculate_validation_loss(model, val_loader)
@@ -295,16 +322,27 @@ def main():
         print(f"  [val] step {0:5d} | loss {validation_loss:.4f}")
 
     model.train()
+    batches_per_epoch = len(train_loader)
+    learning_rate_display = f"{optimizer.param_groups[0]['lr']:.3g}".replace("e-0", "e-")
     progress = tqdm(
         total=args.num_iters,
-        desc="train loss=----",
+        desc=(
+            f"epoch=1 batch=0/{batches_per_epoch} loss=---- "
+            f"lr={learning_rate_display}"
+        ),
         unit="step",
         ncols=terminal_columns,
     )
     completed_steps = 0
+    epoch_number = 0
+    examples_seen = 0
+    loss_sum_since_log = 0.0
+    response_tokens_since_log = 0
+    training_start_time = time.monotonic()
 
     while completed_steps < args.num_iters:
-        for input_ids, loss_mask in train_loader:
+        epoch_number += 1
+        for batch_index, (input_ids, loss_mask) in enumerate(train_loader, start=1):
             if completed_steps >= args.num_iters:
                 break
 
@@ -338,7 +376,10 @@ def main():
                 max_norm=1.0,
             )
 
+            # Record the rate used for this update before advancing the schedule.
+            learning_rate = optimizer.param_groups[0]["lr"]
             optimizer.step()
+            scheduler.step()
 
             loss_value = loss.detach().float().item()
             gradient_norm_value = gradient_norm.detach().float().item()
@@ -348,15 +389,39 @@ def main():
                 1e-8,
             )
             completed_steps = step
+            examples_seen += input_ids.shape[0]
+            dataset_passes = examples_seen / len(train_dataset)
 
-            writer.add_scalar("train/loss", loss_value, step)
-            writer.add_scalar("train/grad_norm", gradient_norm_value, step)
-            writer.add_scalar("train/learning_rate", args.lr, step)
-            writer.add_scalar("train/response_tokens", response_token_count, step)
-            writer.add_scalar("train/tokens_per_sec", tokens_per_second, step)
+            loss_sum_since_log += loss_value * response_token_count
+            response_tokens_since_log += response_token_count
+            if step % args.log_every == 0 or step == args.num_iters:
+                writer.add_scalar(
+                    "train/loss",
+                    loss_sum_since_log / response_tokens_since_log,
+                    step,
+                )
+                writer.add_scalar("train/grad_norm", gradient_norm_value, step)
+                writer.add_scalar("train/learning_rate", learning_rate, step)
+                writer.add_scalar("train/response_tokens", response_token_count, step)
+                writer.add_scalar("train/tokens_per_sec", tokens_per_second, step)
+                writer.add_scalar("train/epoch", dataset_passes, step)
+                writer.add_scalar("train/examples_seen", examples_seen, step)
+                loss_sum_since_log = 0.0
+                response_tokens_since_log = 0
 
-            progress.set_description(f"train loss={loss_value:.4f}")
+            learning_rate_display = f"{learning_rate:.3g}".replace("e-0", "e-")
+            progress.set_description(
+                f"epoch={epoch_number} batch={batch_index}/{batches_per_epoch} "
+                f"loss={loss_value:.4f} lr={learning_rate_display}",
+                refresh=False,
+            )
             progress.update(1)
+
+            if examples_seen % len(train_dataset) == 0:
+                progress.write(
+                    f"  [data] completed dataset pass {int(dataset_passes)} | "
+                    f"step {step:5d}"
+                )
 
             if args.eval_every > 0 and step % args.eval_every == 0:
                 validation_loss = calculate_validation_loss(model, val_loader)
@@ -367,7 +432,10 @@ def main():
 
             if args.save_every > 0 and step % args.save_every == 0:
                 writer.flush()
-                save_checkpoint(model, tokenizer, args.checkpoint_dir, step)
+                save_checkpoint(
+                    model, tokenizer, args.checkpoint_dir, step, training_start_time,
+                    learning_rate,
+                )
 
     progress.close()
 
@@ -377,7 +445,10 @@ def main():
         and completed_steps % args.save_every != 0
     ):
         writer.flush()
-        save_checkpoint(model, tokenizer, args.checkpoint_dir, completed_steps)
+        save_checkpoint(
+            model, tokenizer, args.checkpoint_dir, completed_steps, training_start_time,
+            learning_rate,
+        )
 
     writer.close()
     sys.stdout.flush()
