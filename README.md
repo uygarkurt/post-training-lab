@@ -22,6 +22,8 @@ Apple M4 chip.
 | MLX | Apple Silicon | Supported | [MLX backend](mlx_backend/README.md) |
 | PyTorch (CUDA) | NVIDIA GPU | Supported | [PyTorch (CUDA) backend](cuda_backend/README.md) |
 
+> **Note:** All scripts in `mlx_backend/` are AI-generated.
+
 ## Supported algorithms
 
 | Algorithm | MLX (Apple Silicon) | PyTorch (CUDA) |
@@ -36,10 +38,19 @@ Support below includes SFT, GRPO, and evaluation.
 | Task | Dataset | MLX (Apple Silicon) | PyTorch (CUDA) |
 | ---- | ------- | ------------------- | -------------- |
 | Math reasoning (GSM8K) | `gsm8k` | ✅ | ✅ |
-| Tool calling (xLAM) | `xlam-tool-calling-mixed` | — | ✅ |
+| Tool calling (xLAM) | `xlam-tool-calling-mixed` | ✅ | ✅ |
 
-Select a task in CUDA SFT and GRPO with `--dataset gsm8k` (default) or
+Select a task in MLX or CUDA SFT and GRPO with `--dataset gsm8k` (default) or
 `--dataset xlam-tool-calling-mixed`.
+
+For example, train tool calling with MLX:
+
+```bash
+uv run --extra mlx -m mlx_backend.sft_train \
+  --dataset xlam-tool-calling-mixed --checkpoint-dir ./checkpoints/mlx/sft
+uv run --extra mlx -m mlx_backend.grpo_train \
+  --dataset xlam-tool-calling-mixed --checkpoint-dir ./checkpoints/mlx/grpo
+```
 
 ## Tutorials
 
@@ -68,7 +79,8 @@ post-training-lab/
 │   ├── sft_train.py
 │   ├── grpo_train.py
 │   ├── generate_text.py
-│   └── gsm8k_eval.py
+│   ├── gsm8k_eval.py
+│   └── xlam_function_calling_eval.py
 ├── cuda_backend/            # Runnable PyTorch implementation
 │   ├── sft_train.py         # Supervised fine-tuning with LoRA or full training
 │   ├── grpo_train.py
@@ -82,15 +94,14 @@ post-training-lab/
 ├── tutorials/
 │   ├── README.md
 │   └── grpo_minimal_pytorch.py # Self-contained minimal PyTorch GRPO
-├── checkpoints/             # Checkpoints and CUDA run logs (gitignored)
-└── runs/                    # MLX run logs (gitignored)
+└── checkpoints/             # Checkpoints and run logs (gitignored)
 ```
 
-CUDA training runs keep `run_logs/` (arguments, terminal output, and TensorBoard
-events) beside step checkpoints in
-`checkpoints/cuda/<algorithm>/<algorithm>_<timestamp>/`. MLX runs use
-`runs/mlx/<algorithm>/<algorithm>_<timestamp>/` with matching checkpoints in
-`checkpoints/mlx/<algorithm>/<algorithm>_<timestamp>/`.
+Both backends keep `run_logs/` (arguments, terminal output, and TensorBoard
+events) beside step checkpoints under
+`<checkpoint-dir>/<algorithm>_<timestamp>/`. Both currently default to
+`checkpoints/cuda/<algorithm>/`; pass
+`--checkpoint-dir ./checkpoints/mlx/<algorithm>` to keep MLX outputs separate.
 
 
 Generate text or evaluate a PyTorch/CUDA checkpoint on the GSM8K test split:

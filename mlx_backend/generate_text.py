@@ -6,7 +6,34 @@ import json
 import os
 
 from mlx_lm import load, generate
+from mlx_lm.generate import BatchGenerator
 from mlx_lm.tuner.utils import load_adapters
+
+
+def generate_completions(policy, prompt_ids, prompt_attention_mask, tokenizer, max_new_tokens):
+    """Greedily generate raw completion IDs, retaining EOS for validation."""
+    # batch_generate returns only text; validation also needs EOS/truncation IDs.
+    # BatchGenerator pads prompts itself, so remove DataLoader padding by its mask.
+    prompts = [
+        ids[mask.bool()].tolist()
+        for ids, mask in zip(prompt_ids, prompt_attention_mask)
+    ]
+    generator = BatchGenerator(
+        policy,
+        max_tokens=max_new_tokens,
+        stop_tokens=[[token] for token in tokenizer.eos_token_ids],
+        prefill_batch_size=len(prompts),
+        completion_batch_size=len(prompts),
+    )
+    try:
+        uids = generator.insert(prompts)
+        completions = {uid: [] for uid in uids}
+        while responses := generator.next_generated():
+            for response in responses:
+                completions[response.uid].append(response.token)
+    finally:
+        generator.close()
+    return [completions[uid] for uid in uids]
 
 
 def read_adapter_config(adapter_dir):

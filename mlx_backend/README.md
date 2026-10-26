@@ -2,7 +2,7 @@
 
 The MLX backend is the runnable Apple Silicon implementation of the
 post-training pipeline. Its SFT and GRPO scripts keep the training math visible
-and use LoRA so experiments can run on modest hardware.
+and support LoRA and full training on GSM8K and xLAM tool-calling data.
 
 Run all commands below from the repository root.
 
@@ -23,13 +23,14 @@ uv sync --extra mlx
 The pipeline is supervised fine-tuning, optional GRPO, then generation:
 
 ```bash
-# 1. SFT: save fused model and adapter files in a timestamped SFT directory
-uv run --extra mlx -m mlx_backend.sft_train
+# 1. SFT: save native adapters and a fused model
+uv run --extra mlx -m mlx_backend.sft_train \
+  --checkpoint-dir ./checkpoints/mlx/sft
 
 # 2. GRPO: continue from an SFT adapter checkpoint
 uv run --extra mlx -m mlx_backend.grpo_train \
-  --model ./checkpoints/mlx/sft/sft_<timestamp>/step_000500 \
-  --load-adapter
+  --adapter ./checkpoints/mlx/sft/sft_<timestamp>/step_000500 \
+  --checkpoint-dir ./checkpoints/mlx/grpo
 
 # 3. Generate from a GRPO adapter checkpoint
 uv run --extra mlx -m mlx_backend.generate_text \
@@ -37,10 +38,23 @@ uv run --extra mlx -m mlx_backend.generate_text \
   --load-adapter
 ```
 
-SFT uses a constant `5e-5` learning rate by default. Its LoRA configuration
-uses rank 8, alpha 16, zero dropout, and all transformer layers. Training
-examples are shuffled deterministically, while validation reports
-response-token loss before training and every 50 steps by default.
+The training arguments and literal defaults match their CUDA counterparts,
+including the `Qwen/Qwen2.5-0.5B-Instruct` model and output paths under
+`checkpoints/cuda/`. The examples above select `checkpoints/mlx/` explicitly
+to keep backend outputs separate. Checkpoint formats are native to each backend;
+`--adapter` accepts native MLX adapters, not CUDA PEFT adapters.
+
+SFT uses a cosine learning-rate schedule from `5e-5` to `5e-6`, with 200
+warmup steps by default. New LoRA adapters use rank 8, alpha 16, zero dropout,
+and all linear layers except the output head. Training examples are shuffled
+deterministically, while validation reports response-token loss before training
+and every 50 steps by default.
+
+Both trainers accept `--dataset gsm8k` (the default) or
+`--dataset xlam-tool-calling-mixed`. Use `--train-mode full` to train all dense
+parameters; if `--adapter` is supplied, it is merged before full training.
+GRPO validates with greedy batched generation and uses the selected dataset's
+binary correctness reward.
 
 The MLX training behavior matches CUDA where the backends share semantics:
 AdamW uses bias correction and weight decay, gradients are clipped to global
@@ -55,27 +69,34 @@ uv run --extra mlx -m mlx_backend.sft_train \
   --debug \
   --debug-samples 2 \
   --num-iters 1 \
+  --warmup-steps 0 \
   --eval-every -1 \
-  --save-every 0
+  --save-every 0 \
+  --checkpoint-dir ./checkpoints/mlx/sft
 ```
 
 ## Checkpoints and monitoring
 
-Runs are saved under `runs/mlx/<algorithm>/<algorithm>_<timestamp>/`, with
-matching checkpoints under
-`checkpoints/mlx/<algorithm>/<algorithm>_<timestamp>/`. Each run directory
-contains the parsed arguments, terminal output, and TensorBoard events.
+Each run is saved under
+`<checkpoint-dir>/<algorithm>_<timestamp>/`. Its `run_logs/` directory contains
+`args.json`, `out.log`, and TensorBoard events. Checkpoints use completed update
+counts such as `step_000100/`, with a final checkpoint when needed.
 
 Monitor the metrics with:
 
 ```bash
-uv run --extra mlx tensorboard --logdir=./runs/mlx
+uv run --extra mlx tensorboard --logdir=./checkpoints/mlx
 ```
 
-Each SFT checkpoint contains both `adapters.safetensors` with its
-`adapter_config.json` and a fused model produced by `mlx_lm.fuse`. Load the
-adapter representation with `--load-adapter`, or omit that flag to load the
-fused checkpoint directly:
+Each LoRA checkpoint contains `adapters.safetensors`, `adapter_config.json`,
+and a fused model. Full-training checkpoints contain a dense model. Both include
+the tokenizer, model configuration, and `metadata.json` with the completed step,
+elapsed hours, and learning rate. Saving a fused copy leaves the live training
+model unchanged.
+
+For subsequent training, pass the original base model with `--model` and the
+native adapter directory with `--adapter`. Generation retains its existing
+`--load-adapter` flag; omit it to load the fused checkpoint directly:
 
 ```bash
 uv run --extra mlx -m mlx_backend.generate_text \
@@ -86,29 +107,30 @@ uv run --extra mlx -m mlx_backend.generate_text \
   --model_path ./checkpoints/mlx/sft/sft_<timestamp>/step_000500
 ```
 
-Set `--lora-layers N` to restrict LoRA to the final `N` transformer layers;
-the default `-1` applies it to every layer.
-
 ## GRPO smoke test
 
-Overfit a tiny GSM8K subset using the real answer-matching reward:
+Run one outer iteration over a tiny GSM8K subset using the real answer reward:
 
 ```bash
 uv run --extra mlx -m mlx_backend.grpo_train \
   --debug \
-  --lr 1e-5 \
-  --eval-every 10 \
-  --num-iters 200
+  --debug-samples 2 \
+  --num-iters 1 \
+  --max-new-tok 16 \
+  --eval-every -1 \
+  --save-every 0 \
+  --checkpoint-dir ./checkpoints/mlx/grpo
 ```
 
 ## Entrypoints
 
-- `sft_train.py` — supervised fine-tuning with LoRA
-- `grpo_train.py` — group-relative policy optimization with LoRA
+- `sft_train.py` — supervised fine-tuning with LoRA or full training
+- `grpo_train.py` — group-relative policy optimization with LoRA or full training
 - `generate_text.py` — inference from a base model, fused checkpoint, or adapter
 - `gsm8k_eval.py` — GSM8K generation-accuracy validation used by GRPO
+- `xlam_function_calling_eval.py` — tool-call validation used by GRPO
 
 Dataset loading, tokenization, splitting, PyTorch DataLoaders, padding, and
-answer matching come from `data_preparation/gsm8k.py`. MLX tensor conversion,
+rewards come from `data_preparation/`. MLX tensor conversion,
 models, losses, optimization, and checkpointing stay in these backend
 entrypoints.

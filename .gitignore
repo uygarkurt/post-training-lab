@@ -1,14 +1,6 @@
 __pycache__/
-mlx-tune/
-nanochat/
-runs/
 checkpoints/
-scripts/
-.claude/
-.cursor/
 .venv/
-final_models/
-notes.txt
 .DS_Store
-data_preparation/magpie_reasoning.py
 notes.md
+paper/
