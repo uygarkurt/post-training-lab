@@ -42,8 +42,7 @@ SFT uses 200 steps of warmup to `5e-5`, followed by cosine decay to `5e-6` by
 default. Its LoRA configuration uses rank 8, alpha 16, zero dropout, and all
 linear layers. Training examples are shuffled deterministically, while
 validation reports response-token loss before training and every 50 steps
-by default. The default dataset is the prepared xLAM and irrelevance split,
-with a 512-token sequence limit.
+by default.
 
 ### SFT learning-rate schedule
 
