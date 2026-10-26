@@ -24,9 +24,6 @@ The pipeline is supervised fine-tuning, optional GRPO, then generation or
 evaluation:
 
 ```bash
-# Prepare the xLAM/irrelevance mixture
-uv run python data/xlam-function-calling-irrelevance/prepare.py
-
 # 1. SFT: save PEFT adapter checkpoints in a timestamped SFT directory
 uv run --extra cuda -m cuda_backend.sft_train
 
@@ -36,14 +33,16 @@ uv run --extra cuda -m cuda_backend.grpo_train \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --adapter ./checkpoints/cuda/sft/sft_<timestamp>/step_000500
 
-# 3. Evaluate a GRPO adapter checkpoint on the local xLAM test split
+# 3. Evaluate a GRPO adapter checkpoint on the xLAM test split
 uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
   --model_path ./checkpoints/cuda/grpo/grpo_<timestamp>/step_000500 \
-  --load-adapter \
-  --dataset-path data/xlam-function-calling-irrelevance/test.jsonl
+  --load-adapter
 ```
 
-SFT and GRPO default to xLAM mixed with irrelevance examples. The binary
+SFT, GRPO, and evaluation load
+[`uygarkurt/xlam-tool-calling-mixed`](https://huggingface.co/datasets/uygarkurt/xlam-tool-calling-mixed)
+directly from Hugging Face; no local preparation is needed. SFT and GRPO use
+the `train` split, and evaluation uses `test`. The binary
 reward checks exact tool-call sets for positive examples and correct abstention
 for irrelevance examples. Validation reports overall exact and function-name
 accuracy plus separate call and no-call accuracy when applicable. Use
@@ -53,7 +52,7 @@ SFT uses 200 steps of warmup to `5e-5`, followed by cosine decay to `5e-6` by
 default. Its LoRA configuration uses rank 8, alpha 16, zero dropout, and all
 linear layers. Training examples are shuffled deterministically, while
 validation reports response-token loss before training and every 50 steps
-by default. The default dataset is the prepared xLAM and irrelevance split,
+by default. The default dataset is the hosted xLAM and irrelevance split,
 with a 512-token sequence limit.
 
 ### SFT learning-rate schedule
@@ -153,17 +152,16 @@ uv run --extra cuda -m cuda_backend.gsm8k_eval \
 
 Omit `--load-adapter` when loading a Hugging Face model or dense checkpoint.
 
-Prepare and evaluate the xLAM/irrelevance mixture:
+Evaluate the xLAM/irrelevance mixture:
 
 ```bash
-uv run python data/xlam-function-calling-irrelevance/prepare.py
 uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
   --model_path Qwen/Qwen2.5-0.5B-Instruct \
   --num-samples 100 \
   --output-jsonl xlam_base.jsonl
 ```
 
-Preparation converts the source's JSON-encoded tool definitions to standard
+The hosted dataset converts the source's JSON-encoded tool definitions to standard
 Transformers schemas and creates query-group-disjoint 62,485/3,289 train/test
 splits containing calls and irrelevant-tool no-call examples. Evaluation
 defaults to this mixed test split, supplies tools through the tokenizer's native
@@ -171,10 +169,12 @@ chat template, and reports strict call-set accuracy, function-name-set accuracy,
 and truncations. Parallel-call order and JSON object key order are ignored;
 names, argument values and types, array order, missing calls, and extra calls
 remain significant. See the
-[mixed xLAM data README](../data/xlam-function-calling-irrelevance/README.md) for the complete
+[dataset card](https://huggingface.co/datasets/uygarkurt/xlam-tool-calling-mixed) for the complete
 recipe and limitations.
 
-Train GRPO on the prepared xLAM and irrelevance training pool, optionally
+To evaluate a local prepared test JSONL file instead, pass `--dataset-path <file>`.
+
+Train GRPO on the hosted xLAM and irrelevance training pool, optionally
 initialized from an SFT adapter:
 
 ```bash
@@ -184,7 +184,7 @@ uv run --extra cuda -m cuda_backend.grpo_train \
   --adapter ./checkpoints/cuda/sft/sft_<timestamp>/step_<number>
 ```
 
-The mixed training file contains 56,753 call examples and 5,732 irrelevant-tool
+The mixed training split contains 56,753 call examples and 5,732 irrelevant-tool
 no-call examples. With the pinned Qwen tokenizer, the default 640-token prompt
 limit retains 43,928 calls and 4,863 no-calls before the seeded 5% runtime
 validation split. Overlong prompts are dropped whole. GRPO defaults to binary
@@ -219,7 +219,7 @@ the final point includes any remaining steps using their actual group count.
 - `grpo_train.py` — group-relative policy optimization with LoRA or full-model training
 - `generate_text.py` — inference from a base model, dense checkpoint, or PEFT adapter
 - `gsm8k_eval.py` — greedy GSM8K test-set evaluation
-- `xlam_function_calling_eval.py` — exact tool-call evaluation on the local xLAM test set
+- `xlam_function_calling_eval.py` — exact tool-call evaluation on the xLAM test set
 
 Dataset loading, tokenization, splitting, PyTorch DataLoaders, padding, and
 answer matching come from `data_preparation/gsm8k.py`,

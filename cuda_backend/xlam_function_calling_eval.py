@@ -158,7 +158,7 @@ def validate(
 
 
 def main():
-    """Load a CUDA checkpoint and evaluate it on the local mixed xLAM test split."""
+    """Load a CUDA checkpoint and evaluate it on the mixed xLAM test split."""
     parser = argparse.ArgumentParser(
         description="Evaluate a CUDA model on the xLAM/irrelevance test split.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -177,8 +177,11 @@ def main():
     parser.add_argument(
         "--dataset-path",
         type=str,
-        default=str(xlam_function_calling.TEST_DATASET_PATH),
-        help="Path to a prepared local xLAM/irrelevance test JSONL file",
+        default=None,
+        help=(
+            "Optional local test JSONL file; defaults to the test split of "
+            f"{xlam_function_calling.DATASET_NAME} on Hugging Face"
+        ),
     )
     parser.add_argument(
         "--max-prompt-len",

@@ -90,10 +90,10 @@ uv run --extra cuda -m cuda_backend.gsm8k_eval --model_path <checkpoint>
 Add `--load-adapter` when `<checkpoint>` is a PEFT adapter checkpoint. See the
 [CUDA backend documentation](cuda_backend/README.md) for complete examples.
 
-Prepare the xLAM/irrelevance mixture and evaluate its local test split:
+Evaluate the xLAM/irrelevance test split, loaded directly from
+[`uygarkurt/xlam-tool-calling-mixed`](https://huggingface.co/datasets/uygarkurt/xlam-tool-calling-mixed):
 
 ```bash
-uv run python data/xlam-function-calling-irrelevance/prepare.py
 uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
   --model_path Qwen/Qwen2.5-0.5B-Instruct \
   --num-samples 100
@@ -111,8 +111,9 @@ uv run --extra cuda -m cuda_backend.grpo_train \
 The evaluator uses each model's native tool-aware chat template and reports
 exact call-set and function-name-set accuracy. The mixed GRPO dataset also
 trains and validates abstention when offered tools are irrelevant. See the
-[mixed xLAM data README](data/xlam-function-calling-irrelevance/README.md) for
-preparation, grading, SFT, GRPO rewards, and reproducibility details.
+[dataset card](https://huggingface.co/datasets/uygarkurt/xlam-tool-calling-mixed)
+for preparation details and the [CUDA backend documentation](cuda_backend/README.md)
+for SFT, GRPO rewards, and evaluation instructions.
 
 ## Citation
 

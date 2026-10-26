@@ -1,21 +1,15 @@
-"""Local xLAM/irrelevance SFT/GRPO data, rewards, and evaluation."""
+"""xLAM/irrelevance SFT/GRPO data, rewards, and evaluation."""
 
 import json
 import re
 from collections import Counter
-from pathlib import Path
 
 import torch
 from datasets import load_dataset as hf_load_dataset
 from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
-TRAIN_DATASET_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "data/xlam-function-calling-irrelevance/train.jsonl"
-)
-TEST_DATASET_PATH = TRAIN_DATASET_PATH.with_name("test.jsonl")
-MIXED_TRAIN_DATASET_PATH = TRAIN_DATASET_PATH
+DATASET_NAME = "uygarkurt/xlam-tool-calling-mixed"
 TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 
 
@@ -124,9 +118,9 @@ def encode_sft_example(tokenizer, query, tools, answers):
 
 
 class XLAMFunctionCallingSFTDataset(Dataset):
-    """Tokenize and hold local xLAM function-calling examples for SFT."""
+    """Tokenize and hold xLAM function-calling examples for SFT."""
 
-    def __init__(self, tokenizer, max_seq_len, dataset_path=TRAIN_DATASET_PATH):
+    def __init__(self, tokenizer, max_seq_len, dataset_path=None):
         """Load training rows and retain complete examples within the limit."""
         self.samples = []
         self.total_rows = 0
@@ -137,7 +131,9 @@ class XLAMFunctionCallingSFTDataset(Dataset):
         self.skipped_no_call_overlong = 0
 
         for row in hf_load_dataset(
-            "json", data_files=str(dataset_path), split="train",
+            "json" if dataset_path else DATASET_NAME,
+            data_files=str(dataset_path) if dataset_path else None,
+            split="train",
         ):
             self.total_rows += 1
             try:
@@ -194,7 +190,7 @@ class XLAMFunctionCallingSFTDataset(Dataset):
         max_seq_len,
         val_split,
         seed,
-        dataset_path=TRAIN_DATASET_PATH,
+        dataset_path=None,
     ):
         """Build deterministic xLAM training and validation datasets."""
         dataset = cls(
@@ -220,7 +216,7 @@ class XLAMFunctionCallingSFTDataset(Dataset):
         max_seq_len,
         seed,
         debug_samples,
-        dataset_path=TRAIN_DATASET_PATH,
+        dataset_path=None,
     ):
         """Build matching tiny xLAM train and validation datasets."""
         dataset = cls(
@@ -241,10 +237,10 @@ class XLAMFunctionCallingSFTDataset(Dataset):
 
 
 class XLAMFunctionCallingGRPODataset(Dataset):
-    """Tokenize and hold local xLAM prompts and reference calls for GRPO."""
+    """Tokenize and hold xLAM prompts and reference calls for GRPO."""
 
     def __init__(
-        self, tokenizer, max_prompt_len, dataset_path=TRAIN_DATASET_PATH,
+        self, tokenizer, max_prompt_len, dataset_path=None,
     ):
         """Load training rows and retain complete prompts within the limit."""
         self.samples = []
@@ -256,7 +252,9 @@ class XLAMFunctionCallingGRPODataset(Dataset):
         self.skipped_no_call_overlong = 0
 
         for row in hf_load_dataset(
-            "json", data_files=str(dataset_path), split="train",
+            "json" if dataset_path else DATASET_NAME,
+            data_files=str(dataset_path) if dataset_path else None,
+            split="train",
         ):
             self.total_rows += 1
             try:
@@ -313,7 +311,7 @@ class XLAMFunctionCallingGRPODataset(Dataset):
         max_prompt_len,
         val_split,
         seed,
-        dataset_path=TRAIN_DATASET_PATH,
+        dataset_path=None,
     ):
         """Build deterministic xLAM GRPO training and validation datasets."""
         dataset = cls(
@@ -341,7 +339,7 @@ class XLAMFunctionCallingGRPODataset(Dataset):
         max_prompt_len,
         seed,
         debug_samples,
-        dataset_path=TRAIN_DATASET_PATH,
+        dataset_path=None,
     ):
         """Build matching tiny xLAM GRPO train and validation datasets."""
         dataset = cls(
@@ -545,14 +543,14 @@ def build_eval_dataloader(dataset, tokenizer, batch_size):
 
 
 class XLAMFunctionCallingEvalDataset(Dataset):
-    """Tokenize local xLAM test prompts with their available tools."""
+    """Tokenize xLAM test prompts with their available tools."""
 
     def __init__(
         self,
         tokenizer,
         max_prompt_len,
         num_samples=None,
-        dataset_path=TEST_DATASET_PATH,
+        dataset_path=None,
     ):
         """Load test rows, optionally retaining only the first N usable rows."""
         self.samples = []
@@ -561,7 +559,9 @@ class XLAMFunctionCallingEvalDataset(Dataset):
         self.skipped_invalid = 0
 
         for row in hf_load_dataset(
-            "json", data_files={"test": str(dataset_path)}, split="test",
+            "json" if dataset_path else DATASET_NAME,
+            data_files={"test": str(dataset_path)} if dataset_path else None,
+            split="test",
         ):
             try:
                 query, tools, answers = parse_prepared_row(
