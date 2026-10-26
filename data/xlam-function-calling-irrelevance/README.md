@@ -1,88 +1,36 @@
-# xLAM function calling with Hammer irrelevance examples
+---
+pretty_name: xLAM Tool Calling with Abstention
+language:
+- en
+tags:
+- tool-calling
+- function-calling
+- abstention
+configs:
+- config_name: default
+  data_files:
+  - split: train
+    path: train.jsonl
+  - split: test
+    path: test.jsonl
+---
 
-Prepare a mixed SFT/GRPO training file and a mixed local test file from the two
-source datasets:
+# xLAM Tool Calling with Abstention
 
-```bash
-uv run python data/xlam-function-calling-irrelevance/prepare.py
-```
+Training only on examples that require a tool call can encourage a model to call a tool even when none of the available tools is suitable. This dataset combines valid tool-call examples with irrelevant-tool no-call examples to teach both call construction and when to abstain.
 
-The script writes `train.jsonl`, `test.jsonl`, and `manifest.json` in this
-directory. Generated files are ignored by Git. Use `--output-dir` to write
-elsewhere, or `--xlam-source-file` and `--irrelevance-source-file` to use local
-copies of the source JSON arrays. The source revisions are pinned in the script;
-the manifest records source and output hashes, counts, and split settings.
-Rerunning the command replaces these three generated files.
+The positive examples come from [`lockon/xlam-function-calling-60k`](https://huggingface.co/datasets/lockon/xlam-function-calling-60k) and are normalized and split before mixing. Tool schemas are converted to Transformers' standard function schema, including nested parameter types, descriptions, and defaults. Malformed rows, unavailable reference tools, unknown reference arguments, and duplicate tool names are discarded. Queries are grouped after collapsing whitespace before splitting. The negative examples come from [`MadeAgents/xlam-irrelevance-7.5k`](https://huggingface.co/datasets/MadeAgents/xlam-irrelevance-7.5k). MadeAgents constructed it by removing the ground-truth tool from sampled xLAM examples and setting `answers` to `[]`.
 
-The positive examples come from
-[`lockon/xlam-function-calling-60k`](https://huggingface.co/datasets/lockon/xlam-function-calling-60k)
-and are normalized and split directly by this preparation script. Tool schemas
-are converted to Transformers' standard function schema, including nested
-parameter types, descriptions, and defaults. Malformed rows, unavailable
-reference tools, unknown reference arguments, and duplicate tool names are
-discarded. Queries are grouped after collapsing whitespace before splitting.
-The negative examples come from
-[`MadeAgents/xlam-irrelevance-7.5k`](https://huggingface.co/datasets/MadeAgents/xlam-irrelevance-7.5k),
-the irrelevance dataset released with Lin, Qiqiang, et al.,
-“[Hammer: Robust Function-Calling for On-Device Language Models via Function
-Masking](https://arxiv.org/abs/2410.04587),” *arXiv:2410.04587* (2024).
-MadeAgents constructed it by removing the ground-truth tool from sampled xLAM
-examples and setting `answers` to `[]`.
+Both sources are normalized to the same JSONL schema: `id`, `query`, JSON-encoded `tools`, and JSON-encoded `answers`. Positive IDs start with `xlam:` and negative IDs with `irrelevance:`. Every retained row has at least one available tool. Negative examples retain irrelevant offered tools and target no tool call (`[]`); irrelevance rows with no tools are excluded. Rows with malformed tools, duplicate tool names, or nonempty irrelevance answers are discarded.
 
-Both sources are normalized to the same JSONL schema: `id`, `query`,
-JSON-encoded `tools`, and JSON-encoded `answers`. Positive IDs start with
-`xlam:` and negative IDs with `irrelevance:`. Every retained row has at least
-one available tool. Negative examples retain irrelevant offered tools and
-target no tool call (`[]`); irrelevance rows with no tools are excluded so
-no-tools prompts are not supervised to produce `[]`. Rows with malformed
-tools, duplicate tool names, or nonempty irrelevance answers are discarded.
+The target test fraction is 5% of each source. xLAM uses its original seeded, whitespace-normalized query-group split. Every negative row whose query occurs in xLAM follows that query into train or test; unmatched negative queries are split by group toward the 5% target. This prevents a positive and negative version of a query from crossing the train/test boundary. The negative test fraction may differ slightly from exactly 5%; the manifest records actual counts. Train and test are each shuffled after mixing.
 
-The target test fraction is 5% of each source. xLAM uses its original seeded,
-whitespace-normalized query-group split. Every negative row whose query occurs
-in xLAM follows that query into train or test; unmatched negative queries are
-split by group toward the 5% target. This prevents a positive and negative
-version of a query from crossing the train/test boundary. The negative test
-fraction may differ slightly from exactly 5%; the manifest records actual
-counts. Train and test are each shuffled after mixing.
-
-With the pinned source revisions and default seed, preparation retains 59,740
-positive rows and 6,034 irrelevant-tool no-call rows. The mixed files contain
-56,753 calls plus 5,732 no-calls for training, and 2,987 calls plus 302
-no-calls for testing. Of the 7,500 irrelevance source rows, 1,446 have no
-available tools and are excluded; 20 have duplicate available-tool names and
-are excluded. The manifest records these exclusions and the generated file
-hashes. Length filtering occurs later in the SFT or GRPO loader, so inspect its
-retained and overlong counts for the chosen tokenizer and sequence limit.
+With the pinned source revisions and default seed, preparation retains 59,740 positive rows and 6,034 irrelevant-tool no-call rows. The mixed files contain 56,753 calls plus 5,732 no-calls for training, and 2,987 calls plus 302 no-calls for testing. Of the 7,500 irrelevance source rows, 1,446 have no available tools and are excluded; 20 have duplicate available-tool names and are excluded. The manifest records these exclusions and the generated file hashes.
 
 ## Training and evaluation
 
-CUDA SFT and GRPO use this mixture by default. Select it explicitly with
-`--dataset xlam-function-calling-irrelevance`, or use `--dataset gsm8k` for
-numeric-answer training:
+For training and evaluation code and instructions, see [Post-Training Lab](https://github.com/uygarkurt/post-training-lab).
 
-```bash
-uv run --extra cuda -m cuda_backend.sft_train \
-  --dataset xlam-function-calling-irrelevance
-uv run --extra cuda -m cuda_backend.grpo_train \
-  --dataset xlam-function-calling-irrelevance
-```
+## Dataset files
 
-Training reads only `train.jsonl`; the seeded runtime validation subset comes
-from that same file. SFT drops complete examples above `--max-seq-len` and
-computes loss only on assistant responses. GRPO drops prompts above
-`--max-prompt-len` and uses the call and abstention rewards described in the
-[CUDA README](../../cuda_backend/README.md).
-
-The evaluator defaults to this directory's `test.jsonl`:
-
-```bash
-uv run --extra cuda -m cuda_backend.xlam_function_calling_eval \
-  --model_path Qwen/Qwen2.5-0.5B-Instruct \
-  --num-samples 100
-```
-
-For an adapter checkpoint, add `--load-adapter` and point `--model_path` to its
-directory. Omit `--num-samples` to evaluate all usable test examples. Evaluation
-uses binary exact-call correctness and reports function-name accuracy plus
-separate call and no-call accuracy. This is a local holdout from the two source
-datasets, not an official xLAM benchmark split.
+The prepared splits are stored in `train.jsonl` and `test.jsonl`. The accompanying `manifest.json` records source revisions, source and output hashes, row counts, filtering exclusions, the random seed, and split settings.
