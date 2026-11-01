@@ -1,9 +1,10 @@
 # Post-Training Lab
 
 A minimal, hackable implementation of the full LLM post-training pipeline:
-supervised fine-tuning (SFT), reinforcement learning with GRPO, evaluation, and
-inference. Each stage is a self-contained script you can read top to bottom,
-understand completely, and bend to your own dataset or reward.
+supervised fine-tuning (SFT), reinforcement learning with GRPO, on-policy
+distillation (OPD), evaluation, and inference. Each stage is a self-contained
+script you can read top to bottom, understand completely, and bend to your own
+dataset or reward.
 
 The priority is clarity over abstraction: no framework to learn, no backend
 layer hiding the algorithm, and no need to trace a dozen files to understand a
@@ -30,17 +31,18 @@ Apple M4 chip.
 | --------- | ------------------- | -------------- |
 | SFT | ✅ | ✅ |
 | GRPO | ✅ | ✅ |
+| OPD | ✅ | ✅ |
 
 ## Supported tasks
 
-Support below includes SFT, GRPO, and evaluation.
+Support below includes SFT, GRPO, OPD, and evaluation.
 
 | Task | Dataset | MLX (Apple Silicon) | PyTorch (CUDA) |
 | ---- | ------- | ------------------- | -------------- |
 | Math reasoning (GSM8K) | `gsm8k` | ✅ | ✅ |
 | Tool calling (xLAM) | `xlam-tool-calling-mixed` | ✅ | ✅ |
 
-Select a task in MLX or CUDA SFT and GRPO with `--dataset gsm8k` (default) or
+Select a task in MLX or CUDA SFT, GRPO, and OPD with `--dataset gsm8k` (default) or
 `--dataset xlam-tool-calling-mixed`.
 
 For example, train tool calling with MLX:
@@ -61,6 +63,7 @@ without navigating through the rest of the repository. See the
 | Tutorial | Backend | Code | Presentation | Video |
 | -------- | ------- | ---- | ------------ | ----- |
 | 👉 Minimal GRPO | PyTorch (CUDA) | [`grpo_minimal_pytorch.py`](tutorials/grpo_minimal_pytorch.py) | [View slides](tutorials/GRPO.pdf) | [Watch on YouTube](https://www.youtube.com/watch?v=vVJjUglOURs) |
+| 👉 Minimal OPD | PyTorch (CUDA) | Pending | Pending | Pending |
 
 ## Shared requirements
 
@@ -78,12 +81,14 @@ post-training-lab/
 ├── mlx_backend/             # Runnable Apple Silicon implementation
 │   ├── sft_train.py
 │   ├── grpo_train.py
+│   ├── opd_train.py
 │   ├── generate_text.py
 │   ├── gsm8k_eval.py
 │   └── xlam_function_calling_eval.py
 ├── cuda_backend/            # Runnable PyTorch implementation
 │   ├── sft_train.py         # Supervised fine-tuning with LoRA or full training
 │   ├── grpo_train.py
+│   ├── opd_train.py
 │   ├── generate_text.py
 │   ├── gsm8k_eval.py
 │   └── xlam_function_calling_eval.py

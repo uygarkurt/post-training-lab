@@ -20,7 +20,6 @@ from data_preparation import gsm8k, xlam_function_calling
 
 
 def parse_args():
-    """Parse the small set of options needed by the SFT scaffold."""
     parser = argparse.ArgumentParser(
         description="SFT for CUDA (NVIDIA GPU).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

@@ -7,6 +7,7 @@ import os
 
 from mlx_lm import load, generate
 from mlx_lm.generate import BatchGenerator
+from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tuner.utils import load_adapters
 
 
@@ -72,33 +73,75 @@ def load_model(model_path, load_adapter):
 
 
 def main():
+    """Parse generation options, load the model, and print its completion."""
     parser = argparse.ArgumentParser(description="Generate text using MLX model")
-    parser.add_argument("--model_path", type=str, default="Qwen/Qwen2-0.5B-Instruct-MLX",
-                        help="Path to MLX model or checkpoint directory")
     parser.add_argument(
-        "--load-adapter", action="store_true",
-        help="Load LoRA adapters from --model_path (requires adapters.safetensors + adapter_config.json)",
+        "--model_path",
+        type=str,
+        default="Qwen/Qwen2-0.5B-Instruct",
+        help="Path to Hugging Face model or native MLX checkpoint directory",
     )
-    parser.add_argument("--prompt", type=str, 
-                        default="Randy has 60 mango trees on his farm. He also has 5 less than half as many coconut trees as mango trees. How many trees does Randy have in all on his farm?",
-                        help="Prompt for text generation")
+    parser.add_argument(
+        "--load-adapter",
+        action="store_true",
+        help="Load native MLX adapters from --model_path",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=(
+            "Randy has 60 mango trees on his farm. He also has 5 less than "
+            "half as many coconut trees as mango trees. How many trees does "
+            "Randy have in all on his farm?"
+        ),
+        help="Prompt for text generation",
+    )
+    parser.add_argument(
+        "--tools-json",
+        type=str,
+        default=None,
+        help="JSON array of available function schemas",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=256,
+        help="Maximum number of tokens to generate",
+    )
     args = parser.parse_args()
-    
+
+    try:
+        tools = json.loads(args.tools_json) if args.tools_json else None
+    except json.JSONDecodeError as error:
+        parser.error(f"--tools-json must be valid JSON: {error}")
+    if tools is not None and not isinstance(tools, list):
+        parser.error("--tools-json must contain a JSON array")
+
     model, tokenizer = load_model(args.model_path, args.load_adapter)
+    model.eval()
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-    # Apply chat template
+
     messages = [{"role": "user", "content": args.prompt}]
     formatted_prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages,
+        tools=tools,
+        tokenize=False,
+        add_generation_prompt=True,
     )
 
     print("=== Formatted Prompt ===")
     print(formatted_prompt)
-    
-    # Generate and print output
-    output = generate(model, tokenizer, prompt=formatted_prompt, verbose=False)
+
+    output = generate(
+        model,
+        tokenizer,
+        prompt=formatted_prompt,
+        max_tokens=args.max_new_tokens,
+        sampler=make_sampler(temp=0.0),
+        verbose=False,
+    )
+
     print("=== Generated Output ===")
     print(output)
 
