@@ -206,27 +206,27 @@ def load_grpo_dataset(tokenizer, args):
     )
 
 
+@torch.no_grad()
 def generate_rollouts(policy, prompt_tensor, group_size, max_new_tok, tokenizer):
     # All allowing mask. Removes EOS and PAD token ambiguity.
     prompt_attention_mask = torch.ones_like(prompt_tensor)
 
-    with torch.no_grad():
-        generated_ids = policy.generate(
-            input_ids=prompt_tensor,
-            attention_mask=prompt_attention_mask,
-            max_new_tokens=max_new_tok,
-            num_return_sequences=group_size,
-            # Match the unmodified softmax distribution scored by token_logprobs.
-            # Override Qwen's inherited top-k and repetition penalty explicitly.
-            **ROLLOUT_SAMPLING,
-            use_cache=True,
-        )  # [G, P + L]
+    generated_ids = policy.generate(
+        input_ids=prompt_tensor,
+        attention_mask=prompt_attention_mask,
+        max_new_tokens=max_new_tok,
+        num_return_sequences=group_size,
+        # Match the unmodified softmax distribution scored by token_logprobs.
+        # Override Qwen's inherited top-k and repetition penalty explicitly.
+        **ROLLOUT_SAMPLING,
+        use_cache=True,
+    )  # [G, P + L]
 
     prompt_length = prompt_tensor.shape[1]  # P
     completion_ids = generated_ids[:, prompt_length:]  # [G, L]
 
     # Works for Qwen. It produces EOS after generation ends. Fills the rest with PAD.
-    is_eos_or_pad = (completion_ids.eq(tokenizer.eos_token_id) | completion_ids.eq(tokenizer.pad_token_id))
+    is_eos_or_pad = (completion_ids == tokenizer.eos_token_id) | (completion_ids == tokenizer.pad_token_id)
 
     # We have to include the first EOS token
     completion_mask = (is_eos_or_pad.cumsum(dim=-1) <= 1).long()  # [G, L]
@@ -289,25 +289,10 @@ def validate_policy(policy, val_dataset, tokenizer, args, writer, step, progress
             args.max_new_tok,
             args.eval_batch_size,
         )
-        writer.add_scalar("val/accuracy", metrics["accuracy"], step)
-        writer.add_scalar("val/name_accuracy", metrics["name_accuracy"], step)
+        writer.add_scalar("val/exact tool-call accuracy", metrics["accuracy"], step)
+        writer.add_scalar("val/function name accuracy", metrics["name_accuracy"], step)
         call_accuracy = metrics.get("call_accuracy", float("nan"))
         no_call_accuracy = metrics.get("no_call_accuracy", float("nan"))
-        irrelevant_tool_accuracy = metrics.get(
-            "irrelevant_tool_accuracy", float("nan"),
-        )
-        if not np.isnan(call_accuracy):
-            writer.add_scalar("val/call_accuracy", call_accuracy, step)
-        if not np.isnan(no_call_accuracy):
-            writer.add_scalar(
-                "val/no_call_accuracy", no_call_accuracy, step,
-            )
-        if not np.isnan(irrelevant_tool_accuracy):
-            writer.add_scalar(
-                "val/irrelevant_tool_accuracy",
-                irrelevant_tool_accuracy,
-                step,
-            )
         message = (
             f"  [val] step {step:5d} | exact call accuracy "
             f"{metrics['accuracy']:.4f} | name accuracy "

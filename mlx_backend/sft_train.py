@@ -26,7 +26,6 @@ from data_preparation import gsm8k, sft, xlam_function_calling
 
 
 def parse_args():
-    """Parse the small set of options needed by the SFT scaffold."""
     parser = argparse.ArgumentParser(
         description="SFT for MLX (Apple Silicon).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
