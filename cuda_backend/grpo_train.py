@@ -289,25 +289,10 @@ def validate_policy(policy, val_dataset, tokenizer, args, writer, step, progress
             args.max_new_tok,
             args.eval_batch_size,
         )
-        writer.add_scalar("val/accuracy", metrics["accuracy"], step)
-        writer.add_scalar("val/name_accuracy", metrics["name_accuracy"], step)
+        writer.add_scalar("val/exact tool-call accuracy", metrics["accuracy"], step)
+        writer.add_scalar("val/function name accuracy", metrics["name_accuracy"], step)
         call_accuracy = metrics.get("call_accuracy", float("nan"))
         no_call_accuracy = metrics.get("no_call_accuracy", float("nan"))
-        irrelevant_tool_accuracy = metrics.get(
-            "irrelevant_tool_accuracy", float("nan"),
-        )
-        if not np.isnan(call_accuracy):
-            writer.add_scalar("val/call_accuracy", call_accuracy, step)
-        if not np.isnan(no_call_accuracy):
-            writer.add_scalar(
-                "val/no_call_accuracy", no_call_accuracy, step,
-            )
-        if not np.isnan(irrelevant_tool_accuracy):
-            writer.add_scalar(
-                "val/irrelevant_tool_accuracy",
-                irrelevant_tool_accuracy,
-                step,
-            )
         message = (
             f"  [val] step {step:5d} | exact call accuracy "
             f"{metrics['accuracy']:.4f} | name accuracy "
