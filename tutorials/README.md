@@ -8,6 +8,7 @@ training, evaluation, and checkpoint saving in one readable Python file.
 | Tutorial | Code | Presentation | Video |
 | -------- | ---- | ------------ | ----- |
 | Minimal GRPO in PyTorch | [`grpo_minimal_pytorch.py`](grpo_minimal_pytorch.py) | [View slides](GRPO.pdf) | [Watch on YouTube](https://www.youtube.com/watch?v=vVJjUglOURs) |
+| Minimal OPD in PyTorch | [`opd_minimal_pytorch.py`](opd_minimal_pytorch.py) | Pending | Pending |
 
 ## Setup
 

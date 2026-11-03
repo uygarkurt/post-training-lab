@@ -63,7 +63,7 @@ without navigating through the rest of the repository. See the
 | Tutorial | Backend | Code | Presentation | Video |
 | -------- | ------- | ---- | ------------ | ----- |
 | 👉 Minimal GRPO | PyTorch (CUDA) | [`grpo_minimal_pytorch.py`](tutorials/grpo_minimal_pytorch.py) | [View slides](tutorials/GRPO.pdf) | [Watch on YouTube](https://www.youtube.com/watch?v=vVJjUglOURs) |
-| 👉 Minimal OPD | PyTorch (CUDA) | Pending | Pending | Pending |
+| 👉 Minimal OPD | PyTorch (CUDA) | [`opd_minimal_pytorch.py`](tutorials/opd_minimal_pytorch.py) | Pending | Pending |
 
 ## Shared requirements
 
@@ -98,7 +98,8 @@ post-training-lab/
 │   └── sft.py               # SFT padding and batching shared by all datasets
 ├── tutorials/
 │   ├── README.md
-│   └── grpo_minimal_pytorch.py # Self-contained minimal PyTorch GRPO
+│   ├── grpo_minimal_pytorch.py # Self-contained minimal PyTorch GRPO
+│   └── opd_minimal_pytorch.py  # Self-contained minimal PyTorch OPD
 └── checkpoints/             # Checkpoints and run logs (gitignored)
 ```
 
