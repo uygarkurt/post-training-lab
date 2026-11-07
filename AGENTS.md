@@ -66,6 +66,16 @@ multiple abstraction layers.
   between MLX and CUDA.
 - Do not modify generated checkpoints or TensorBoard runs.
 
+## Finding files
+
+- When the user provides a path, check that path directly.
+- Before reporting that a file or directory is missing, check whether
+  search tools excluded it through .gitignore, .ignore, or hidden-file rules.
+- If needed, repeat the search with `rg --files --hidden --no-ignore`,
+  limited to the relevant directory.
+- A file being ignored by Git does not mean it is unavailable to read.
+- Ask the user for its location only after these checks fail.
+
 ## Backend structure and parity
 
 - Keep runnable implementations in `cuda_backend/` and `mlx_backend/`.
