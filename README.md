@@ -121,12 +121,7 @@ Add `--load-adapter` when `<checkpoint>` is a PEFT adapter checkpoint. See the
 [CUDA backend documentation](cuda_backend/README.md) for complete examples.
 
 ## Citation
-
-If you use this software, please cite it using the concept DOI below, which
-represents all versions and resolves to the latest release:
-
 ```bibtex
-
 @misc{kurt2026post,
   title     = {Post-Training on the Clock: Specializing a Small Language Model on a Consumer GPU},
   author    = {Kurt, Uygar},
