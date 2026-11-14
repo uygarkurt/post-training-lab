@@ -4,9 +4,10 @@ import json
 import os
 import random
 import re
+import subprocess
+import sys
 import time
 from collections import Counter
-from datetime import UTC, datetime
 
 import numpy as np
 import torch
@@ -113,16 +114,8 @@ def load_policy_and_teacher():
     return policy, teacher, tokenizer
 
 
-class InvalidPreparedRowError(ValueError):
-    """Identify malformed rows in a prepared xLAM JSONL file."""
-
-
-class ToolTemplateError(ValueError):
-    """Identify tokenizers whose chat template does not expose tools."""
-
-
-def parse_prepared_row(row, allow_empty_answers=False, allow_empty_tools=False):
-    """Decode one prepared row, optionally allowing no calls or no tools."""
+def parse_prepared_row(row, tokenizer):
+    """Decode one prepared row and render its tool-aware prompt."""
     query = row["query"]
     tools = json.loads(row["tools"]) if isinstance(row["tools"], str) else row["tools"]
     answers = (
@@ -130,48 +123,13 @@ def parse_prepared_row(row, allow_empty_answers=False, allow_empty_tools=False):
         if isinstance(row["answers"], str)
         else row["answers"]
     )
-    if not isinstance(query, str) or not query.strip():
-        raise InvalidPreparedRowError("query must be a nonempty string")
-    if not isinstance(tools, list) or (not tools and not allow_empty_tools):
-        raise InvalidPreparedRowError("tools must be a nonempty list")
-    if not isinstance(answers, list) or (not answers and not allow_empty_answers):
-        raise InvalidPreparedRowError("answers must be a nonempty list")
-    if not tools and answers:
-        raise InvalidPreparedRowError("a row without tools cannot contain a call")
-    for tool in tools:
-        if (
-            not isinstance(tool, dict)
-            or not isinstance(tool.get("function"), dict)
-            or not isinstance(tool["function"].get("name"), str)
-        ):
-            raise InvalidPreparedRowError(
-                "tools must use the standard function schema"
-            )
-    for answer in answers:
-        if (
-            not isinstance(answer, dict)
-            or not isinstance(answer.get("name"), str)
-            or not isinstance(answer.get("arguments"), dict)
-        ):
-            raise InvalidPreparedRowError(
-                "answers must contain names and argument objects"
-            )
-    return query, tools, answers
-
-
-def render_prompt(tokenizer, query, tools):
-    """Render one tool-aware user prompt with the tokenizer's chat template."""
     prompt_text = tokenizer.apply_chat_template(
         [{"role": "user", "content": query}],
         tools=tools,
         tokenize=False,
         add_generation_prompt=True,
     )
-    if tools and tools[0]["function"]["name"] not in prompt_text:
-        raise ToolTemplateError(
-            "The tokenizer chat template did not render the provided tools"
-        )
-    return prompt_text
+    return query, tools, answers, prompt_text
 
 
 class XLAMFunctionCallingGRPODataset(Dataset):
@@ -196,14 +154,11 @@ class XLAMFunctionCallingGRPODataset(Dataset):
         ):
             self.total_rows += 1
             try:
-                query, tools, answers = parse_prepared_row(
-                    row, allow_empty_answers=True,
-                )
+                query, tools, answers, prompt_text = parse_prepared_row(row, tokenizer)
                 if not answers:
                     self.no_call_rows += 1
-                prompt_text = render_prompt(tokenizer, query, tools)
                 prompt_ids = tokenizer.encode(prompt_text)
-            except (InvalidPreparedRowError, KeyError, json.JSONDecodeError):
+            except (KeyError, json.JSONDecodeError):
                 self.skipped_invalid += 1
                 continue
             if len(prompt_ids) > max_prompt_len:
@@ -423,12 +378,9 @@ class XLAMFunctionCallingEvalDataset(Dataset):
             split="test",
         ):
             try:
-                query, tools, answers = parse_prepared_row(
-                    row, allow_empty_answers=True, allow_empty_tools=True,
-                )
-                prompt_text = render_prompt(tokenizer, query, tools)
+                query, tools, answers, prompt_text = parse_prepared_row(row, tokenizer)
                 prompt_ids = tokenizer.encode(prompt_text)
-            except (InvalidPreparedRowError, KeyError, json.JSONDecodeError):
+            except (KeyError, json.JSONDecodeError):
                 self.skipped_invalid += 1
                 self.skipped += 1
                 continue
@@ -463,8 +415,10 @@ def validate(
     max_new_tokens,
     batch_size,
     description="val",
+    step=None,
+    progress=None,
 ):
-    """Measure exact tool-call and function-name accuracy with greedy decoding."""
+    """Measure tool-call accuracy with greedy decoding and optionally log the step."""
     correct_calls = 0
     correct_names = 0
     total_answers = 0
@@ -514,36 +468,26 @@ def validate(
                 correct_calls += calls_correct
             total_answers += len(batch["answers"])
 
-    if total_answers == 0:
-        return {"accuracy": float("nan"), "name_accuracy": float("nan")}
-    print(
-        f"  {correct_calls}/{total_answers} exact call sets; "
-        f"{correct_names}/{total_answers} function-name sets."
-    )
-    return {
-        "accuracy": correct_calls / total_answers,
-        "name_accuracy": correct_names / total_answers,
+    if total_answers:
+        print(
+            f"  {correct_calls}/{total_answers} exact call sets; "
+            f"{correct_names}/{total_answers} function-name sets."
+        )
+    metrics = {
+        "accuracy": correct_calls / total_answers if total_answers else float("nan"),
+        "name_accuracy": correct_names / total_answers if total_answers else float("nan"),
     }
-
-
-def validate_policy(policy, val_dataset, tokenizer, step, progress=None):
-    """Run and log the validation metrics for the selected prompt dataset."""
-    metrics = validate(
-        policy,
-        val_dataset,
-        tokenizer,
-        MAX_NEW_TOKENS,
-        EVALUATION_BATCH_SIZE,
-    )
-    message = (
-        f"  [val] step {step:5d} | exact call accuracy "
-        f"{metrics['accuracy']:.4f} | name accuracy "
-        f"{metrics['name_accuracy']:.4f}"
-    )
-    if progress is None:
-        print(message)
-    else:
-        progress.write(message)
+    if step is not None:
+        message = (
+            f"  [val] step {step:5d} | exact call accuracy "
+            f"{metrics['accuracy']:.4f} | name accuracy "
+            f"{metrics['name_accuracy']:.4f}"
+        )
+        if progress is None:
+            print(message)
+        else:
+            progress.write(message)
+    return metrics
 
 
 @torch.no_grad()
@@ -617,190 +561,209 @@ def main():
         "DATASET_NAME": DATASET_NAME,
         "ROLLOUT_SAMPLING": ROLLOUT_SAMPLING,
     }
-    timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
-    run_name = f"opd_{timestamp}"
-    checkpoint_dir = os.path.join(
-        os.path.normpath(CHECKPOINT_DIRECTORY),
-        run_name,
-    )
+    checkpoint_dir = os.path.normpath(CHECKPOINT_DIRECTORY)
     run_logs_dir = os.path.join(checkpoint_dir, "run_logs")
-    os.makedirs(run_logs_dir)
+    os.makedirs(run_logs_dir, exist_ok=True)
 
     with open(os.path.join(run_logs_dir, "args.json"), "w") as args_file:
         json.dump(saved_args, args_file, indent=2)
 
     terminal_columns = os.get_terminal_size(2).columns if os.isatty(2) else None
-    print(f"Run logs directory: {run_logs_dir}")
-    print(f"Checkpoint directory: {checkpoint_dir}")
-    print(f"Rollout sampling: {ROLLOUT_SAMPLING}")
-
-    set_random_seed(SEED)
-    policy, teacher, tokenizer = load_policy_and_teacher()
-    trainable_parameters = [
-        parameter
-        for parameter in policy.parameters()
-        if parameter.requires_grad
-    ]
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=LEARNING_RATE)
-    print("Loading xlam-tool-calling-mixed dataset ...")
-    train_samples, val_dataset = XLAMFunctionCallingGRPODataset.build_train_val_datasets(
-        tokenizer,
-        max_prompt_len=MAX_PROMPT_LENGTH,
-        val_split=VALIDATION_SPLIT,
-        seed=SEED,
+    terminal_stdout = os.dup(1)
+    terminal_stderr = os.dup(2)
+    tee_process = subprocess.Popen(
+        ["tee", os.path.join(run_logs_dir, "out.log")],
+        stdin=subprocess.PIPE,
     )
+    progress = None
+    try:
+        os.dup2(tee_process.stdin.fileno(), 1)
+        os.dup2(tee_process.stdin.fileno(), 2)
+        print(f"Run logs directory: {run_logs_dir}")
+        print(f"Checkpoint directory: {checkpoint_dir}")
+        print(f"Rollout sampling: {ROLLOUT_SAMPLING}")
 
-    print("Loading xLAM/irrelevance function-calling test split ...")
-    test_dataset = XLAMFunctionCallingEvalDataset(
-        tokenizer,
-        max_prompt_len=MAX_PROMPT_LENGTH,
-    )
-    print(
-        f"  {len(test_dataset)} samples loaded, "
-        f"{test_dataset.skipped} skipped."
-    )
-
-    initial_test_metrics = validate(
-        policy,
-        test_dataset,
-        tokenizer,
-        MAX_NEW_TOKENS,
-        EVALUATION_BATCH_SIZE,
-        description="test before training",
-    )
-    print(
-        "xLAM test exact tool-call accuracy before training: "
-        f"{initial_test_metrics['accuracy']:.4f}"
-    )
-    print(
-        "xLAM test function-name accuracy before training: "
-        f"{initial_test_metrics['name_accuracy']:.4f}"
-    )
-
-    if EVALUATE_EVERY != -1:
-        validate_policy(policy, val_dataset, tokenizer, step=0)
-
-    batches_per_epoch = len(train_samples)
-    total_steps = NUM_ITERATIONS if batches_per_epoch else 0
-    learning_rate_display = f"{optimizer.param_groups[0]['lr']:.3g}".replace("e-0", "e-")
-    progress = tqdm(
-        total=total_steps,
-        desc=(
-            f"epoch=1 batch=0/{batches_per_epoch} loss=---- "
-            f"lr={learning_rate_display}"
-        ),
-        unit="step",
-        ncols=terminal_columns,
-    )
-    completed_steps = 0
-    training_start_time = time.monotonic()
-
-    for step in range(total_steps):
-        epoch_number, batch_offset = divmod(step, batches_per_epoch)
-        batch_index = batch_offset + 1
-        sample = train_samples[batch_offset]
-        prompt_tensor = torch.tensor(
-            sample["prompt_ids"], dtype=torch.long, device="cuda",
-        ).unsqueeze(0)  # [1, P]
-
-        rollouts, rollout_masks = generate_rollouts(
-            policy,
-            prompt_tensor,
-            NUM_ROLLOUTS,
-            MAX_NEW_TOKENS,
+        set_random_seed(SEED)
+        policy, teacher, tokenizer = load_policy_and_teacher()
+        trainable_parameters = [
+            parameter
+            for parameter in policy.parameters()
+            if parameter.requires_grad
+        ]
+        optimizer = torch.optim.AdamW(trainable_parameters, lr=LEARNING_RATE)
+        print("Loading xlam-tool-calling-mixed dataset ...")
+        train_samples, val_dataset = XLAMFunctionCallingGRPODataset.build_train_val_datasets(
             tokenizer,
-        )  # [N, L], [N, L]
-
-        prompt_ids_extended = torch.repeat_interleave(prompt_tensor, repeats=rollouts.size(0), dim=0)  # [N, P]
-        complete_ids = torch.cat([prompt_ids_extended, rollouts], dim=-1)  # [N, P + L]
-
-        student_logits = policy(complete_ids, use_cache=False).logits  # [N, P + L, V]
-
-        # Take the last prompt token, the rest is regular logits shift
-        student_logits_shift = student_logits[:, prompt_tensor.size(1) - 1:-1, :]  # [N, L, V]
-
-        with torch.no_grad():
-            teacher_logits = teacher(complete_ids, use_cache=False).logits  # [N, P + L, V]
-            teacher_logits_shift = teacher_logits[:, prompt_tensor.size(1) - 1:-1, :]  # [N, L, V]
-
-        student_logprobs = torch.log_softmax(
-            student_logits_shift, dim=-1, dtype=torch.float32,
-        )  # [N, L, V]
-        teacher_logprobs = torch.log_softmax(
-            teacher_logits_shift, dim=-1, dtype=torch.float32,
-        )  # [N, L, V]
-
-        # Summing over V gives KL div values for every position
-        kl = F.kl_div(
-            teacher_logprobs,
-            student_logprobs,
-            log_target=True,
-            reduction="none",
-        ).sum(dim=-1)  # [N, L]
-
-        opd_loss = (kl * rollout_masks).sum() / rollout_masks.sum()
-
-        optimizer.zero_grad()
-        opd_loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(
-            trainable_parameters,
-            max_norm=1.0,
+            max_prompt_len=MAX_PROMPT_LENGTH,
+            val_split=VALIDATION_SPLIT,
+            seed=SEED,
         )
 
-        optimizer.step()
-
-        completed_step = step + 1
-        completed_steps = completed_step
-        mean_loss = opd_loss.detach().float().item()
-        learning_rate_display = f"{optimizer.param_groups[0]['lr']:.3g}".replace("e-0", "e-")
-        progress.set_description(
-            f"epoch={epoch_number + 1} batch={batch_index}/{batches_per_epoch} "
-            f"loss={mean_loss:.4f} lr={learning_rate_display}",
-            refresh=False,
+        print("Loading xLAM/irrelevance function-calling test split ...")
+        test_dataset = XLAMFunctionCallingEvalDataset(
+            tokenizer,
+            max_prompt_len=MAX_PROMPT_LENGTH,
         )
-        progress.update(1)
+        print(
+            f"  {len(test_dataset)} samples loaded, "
+            f"{test_dataset.skipped} skipped."
+        )
 
-        if EVALUATE_EVERY > 0 and completed_step % EVALUATE_EVERY == 0:
-            validate_policy(
-                policy, val_dataset, tokenizer, completed_step,
-                progress=progress,
+        initial_test_metrics = validate(
+            policy,
+            test_dataset,
+            tokenizer,
+            MAX_NEW_TOKENS,
+            EVALUATION_BATCH_SIZE,
+            description="test before training",
+        )
+        print(
+            "xLAM test exact tool-call accuracy before training: "
+            f"{initial_test_metrics['accuracy']:.4f}"
+        )
+        print(
+            "xLAM test function-name accuracy before training: "
+            f"{initial_test_metrics['name_accuracy']:.4f}"
+        )
+
+        if EVALUATE_EVERY != -1:
+            validate(
+                policy, val_dataset, tokenizer, MAX_NEW_TOKENS,
+                EVALUATION_BATCH_SIZE, step=0,
             )
 
-        if SAVE_EVERY > 0 and completed_step % SAVE_EVERY == 0:
+        batches_per_epoch = len(train_samples)
+        total_steps = NUM_ITERATIONS if batches_per_epoch else 0
+        learning_rate_display = f"{optimizer.param_groups[0]['lr']:.3g}".replace("e-0", "e-")
+        progress = tqdm(
+            total=total_steps,
+            desc=(
+                f"epoch=1 batch=0/{batches_per_epoch} loss=---- "
+                f"lr={learning_rate_display}"
+            ),
+            unit="step",
+            ncols=terminal_columns,
+        )
+        completed_steps = 0
+        training_start_time = time.monotonic()
+
+        for step in range(total_steps):
+            epoch_number, batch_offset = divmod(step, batches_per_epoch)
+            batch_index = batch_offset + 1
+            sample = train_samples[batch_offset]
+            prompt_tensor = torch.tensor(
+                sample["prompt_ids"], dtype=torch.long, device="cuda",
+            ).unsqueeze(0)  # [1, P]
+
+            rollouts, rollout_masks = generate_rollouts(
+                policy,
+                prompt_tensor,
+                NUM_ROLLOUTS,
+                MAX_NEW_TOKENS,
+                tokenizer,
+            )  # [N, L], [N, L]
+
+            prompt_ids_extended = torch.repeat_interleave(prompt_tensor, repeats=rollouts.size(0), dim=0)  # [N, P]
+            complete_ids = torch.cat([prompt_ids_extended, rollouts], dim=-1)  # [N, P + L]
+
+            student_logits = policy(complete_ids, use_cache=False).logits  # [N, P + L, V]
+
+            # Take the last prompt token, the rest is regular logits shift
+            student_logits_shift = student_logits[:, prompt_tensor.size(1) - 1:-1, :]  # [N, L, V]
+
+            with torch.no_grad():
+                teacher_logits = teacher(complete_ids, use_cache=False).logits  # [N, P + L, V]
+                teacher_logits_shift = teacher_logits[:, prompt_tensor.size(1) - 1:-1, :]  # [N, L, V]
+
+            student_logprobs = torch.log_softmax(
+                student_logits_shift, dim=-1, dtype=torch.float32,
+            )  # [N, L, V]
+            teacher_logprobs = torch.log_softmax(
+                teacher_logits_shift, dim=-1, dtype=torch.float32,
+            )  # [N, L, V]
+
+            # Summing over V gives KL div values for every position
+            kl = F.kl_div(
+                teacher_logprobs,
+                student_logprobs,
+                log_target=True,
+                reduction="none",
+            ).sum(dim=-1)  # [N, L]
+
+            opd_loss = (kl * rollout_masks).sum() / rollout_masks.sum()
+
+            optimizer.zero_grad()
+            opd_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                trainable_parameters,
+                max_norm=1.0,
+            )
+
+            optimizer.step()
+
+            completed_step = step + 1
+            completed_steps = completed_step
+            mean_loss = opd_loss.detach().float().item()
+            learning_rate_display = f"{optimizer.param_groups[0]['lr']:.3g}".replace("e-0", "e-")
+            progress.set_description(
+                f"epoch={epoch_number + 1} batch={batch_index}/{batches_per_epoch} "
+                f"loss={mean_loss:.4f} lr={learning_rate_display}",
+                refresh=False,
+            )
+            progress.update(1)
+
+            if EVALUATE_EVERY > 0 and completed_step % EVALUATE_EVERY == 0:
+                validate(
+                    policy, val_dataset, tokenizer, MAX_NEW_TOKENS,
+                    EVALUATION_BATCH_SIZE, step=completed_step, progress=progress,
+                )
+
+            if SAVE_EVERY > 0 and completed_step % SAVE_EVERY == 0:
+                save_checkpoint(
+                    policy, tokenizer, checkpoint_dir, completed_step,
+                    training_start_time, optimizer.param_groups[0]["lr"],
+                )
+
+        progress.close()
+
+        if (
+            SAVE_EVERY > 0
+            and completed_steps > 0
+            and completed_steps % SAVE_EVERY != 0
+        ):
             save_checkpoint(
-                policy, tokenizer, checkpoint_dir, completed_step,
+                policy, tokenizer, checkpoint_dir, completed_steps,
                 training_start_time, optimizer.param_groups[0]["lr"],
             )
 
-    progress.close()
-
-    if (
-        SAVE_EVERY > 0
-        and completed_steps > 0
-        and completed_steps % SAVE_EVERY != 0
-    ):
-        save_checkpoint(
-            policy, tokenizer, checkpoint_dir, completed_steps,
-            training_start_time, optimizer.param_groups[0]["lr"],
+        final_test_metrics = validate(
+            policy,
+            test_dataset,
+            tokenizer,
+            MAX_NEW_TOKENS,
+            EVALUATION_BATCH_SIZE,
+            description="test after training",
         )
-
-    final_test_metrics = validate(
-        policy,
-        test_dataset,
-        tokenizer,
-        MAX_NEW_TOKENS,
-        EVALUATION_BATCH_SIZE,
-        description="test after training",
-    )
-    print(
-        "xLAM test exact tool-call accuracy after training:  "
-        f"{final_test_metrics['accuracy']:.4f}"
-    )
-    print(
-        "xLAM test function-name accuracy after training:  "
-        f"{final_test_metrics['name_accuracy']:.4f}"
-    )
+        print(
+            "xLAM test exact tool-call accuracy after training:  "
+            f"{final_test_metrics['accuracy']:.4f}"
+        )
+        print(
+            "xLAM test function-name accuracy after training:  "
+            f"{final_test_metrics['name_accuracy']:.4f}"
+        )
+    finally:
+        if progress is not None:
+            progress.close()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(terminal_stdout, 1)
+        os.dup2(terminal_stderr, 2)
+        os.close(terminal_stdout)
+        os.close(terminal_stderr)
+        tee_process.stdin.close()
+        tee_process.wait()
 
 
 if __name__ == "__main__":

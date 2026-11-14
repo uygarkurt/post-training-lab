@@ -126,13 +126,14 @@ If you use this software, please cite it using the concept DOI below, which
 represents all versions and resolves to the latest release:
 
 ```bibtex
-@software{kurt_post_training_lab,
+
+@misc{kurt2026post,
+  title     = {Post-Training on the Clock: Specializing a Small Language Model on a Consumer GPU},
   author    = {Kurt, Uygar},
-  title     = {Post-Training Lab},
   year      = {2026},
-  publisher = {Zenodo},
-  doi       = {10.5281/zenodo.21111796},
-  url       = {https://doi.org/10.5281/zenodo.21111796}
+  publisher = {Research Square},
+  doi       = {10.21203/rs.3.rs-11540864/v1},
+  url       = {https://doi.org/10.21203/rs.3.rs-11540864/v1}
 }
 ```
 
